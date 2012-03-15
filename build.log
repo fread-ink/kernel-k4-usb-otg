@@ -1,0 +1,14 @@
+scripts/kconfig/conf -s arch/arm/Kconfig
+  CHK     include/linux/version.h
+make[1]: `include/asm-arm/mach-types.h' is up to date.
+  CHK     include/linux/utsrelease.h
+  SYMLINK include/asm -> include/asm-arm
+  CALL    scripts/checksyscalls.sh
+  CC      init/main.o
+/tmp/ccWaPLVP.s: Assembler messages:
+/tmp/ccWaPLVP.s:266: Error: selected processor does not support `cpsie i'
+/tmp/ccWaPLVP.s:740: Error: selected processor does not support `cpsid i'
+/tmp/ccWaPLVP.s:815: Error: selected processor does not support `cpsid i'
+/tmp/ccWaPLVP.s:839: Error: selected processor does not support `cpsie i'
+make[1]: *** [init/main.o] Error 1
+make: *** [init] Error 2
