@@ -55,7 +55,7 @@
 #include <mach/arc_otg.h>
 #include <mach/hardware.h>
 #include <mach/boardid.h>
-#include <linux/pmic_external.h>
+#include <mach/charger.h>
 #include <linux/pmic_adc.h>
 #include <linux/pmic_light.h>
 
@@ -77,13 +77,8 @@
 
 #define	DMA_ADDR_INVALID	(~(dma_addr_t)0)
 
-
-/*
- *	The spec sheet is not clear about these two bits. The name and description shifted for a row. 
- *	See P143 mc13892 user guild.
- * */
-#define CHGFAULTM 0x000300
-
+#define CHARGING_THIRD_PARTY   0x5     /* Third party chargers */
+#define CHARGING_HOST 0x1
 
 static const char driver_name[] = "fsl-usb2-udc";
 static const char driver_desc[] = DRIVER_DESC;
@@ -94,24 +89,12 @@ volatile static struct usb_sys_interface *usb_sys_regs;
 /* it is initialized in probe()  */
 static struct fsl_udc *udc_controller;
 
-extern int yoshi_voltage;
-extern int yoshi_battery_current;
-extern int yoshi_battery_id;
-extern int yoshi_battery_capacity;
-extern int yoshi_reduce_charging;
-
 extern void accessory_charger_disable(void);
 extern void accessory_charger_enable(void);
 extern int gpio_accessory_charger_detected(void);
 
 /* SPI Suspended? */
 extern int mxc_spi_suspended;
-
-/* Battery present and valid? */
-extern int yoshi_battery_valid(void);
-
-extern void gpio_chrgled_active(int enable); 
-extern int pmic_check_factory_mode(void);
 
 extern void mxc_kernel_uptime(void);
 
@@ -141,20 +124,14 @@ static const size_t g_iram_size = IRAM_TD_PPH_SIZE;
 
 static void resume_ctrl(void);
 static int udc_suspend(struct fsl_udc *udc);
+static void do_charge_current_work(struct work_struct *work);
 static int fsl_udc_suspend(struct device *dev, pm_message_t state);
 static int fsl_udc_resume(struct device *dev);
 static void fsl_ep_fifo_flush(struct usb_ep *_ep);
-static int green_led_set = 0;
 static int udc_detection = 0;
-static int saved_ichrg_value = 0;
 static int udc_stopped = 0;
-static int lobat_condition = 0;
 
-static int charger_timer_expiry_threshold = 0;
-static int charger_timer_expiry_counter = 0;
-static int fsl_vbus_done = 0;
-
-static int crit_boot_flag = 0;
+static int current_limit;
 static int charging_wall_mA = 0;
 
 /* Do not suspend the PHY */
@@ -183,20 +160,6 @@ extern struct resource *otg_get_resources(void);
 #define fsl_writel(addr, val32) writel((addr), (val32))
 #endif
 
-/* 
- * Charger
- */
-static pmic_event_callback_t charger_detect;
-static pmic_event_callback_t lobatli_event;
-static pmic_event_callback_t lobathi_event;
-static pmic_event_callback_t bpon_event;
-static pmic_event_callback_t chgfaulti_event;
-static pmic_event_callback_t chrgse1b_event;
-static pmic_event_callback_t bvalid_detect;
-
-static int pmic_set_chg_current(unsigned short curr);
-static void pmic_enable_green_led(int enable);
-
 static struct clk *usb_ahb_clk;
 static struct clk *usb_phy1_clk;
 static void fsl_idle_low_power_exit(struct fsl_udc *udc);
@@ -204,121 +167,33 @@ static void fsl_idle_low_power_enter(struct fsl_udc *udc);
 static void fsl_detect_charger_type(void);
 static int not_detected = 0;
 static int host_detected = 0; 		/* Has a host been detected? */
-static void pmic_start_charging(int value);
 
 static void phy_low_power_resume(struct work_struct *work);
+DECLARE_WORK(charge_current_work, do_charge_current_work);
 static DECLARE_DELAYED_WORK(phy_resume_work, phy_low_power_resume);
 
 static int udc_suspended_mode = 0; /* gadget driver suspended state */
 
-static int third_party_detect_timer = 0;
 static int usb_lpm_timer = 0;
 
 #define VBUSVALIDS		0x08	/* Sense bit for valid VBUS */
-#define CHGDETS  		0x40	/* Sense bit for CHGDET */
-#define BVALIDS			0x10000	/* Sense bit for BVALID */
-#define CHGCURRS		0x800	/* Bit #11 */
-#define CHGCURRS_THRESHOLD	4100	/* CHGCURRS Threshold */
 #define PC_WORK_THRESHOLD	30000	/* Port change threshold */
 #define ARCOTG_IRQ		37
 #define CHARGER_STARTUP 	4000	/* Delayed workqueue that runs on startup */
-#define CHARGER_MISC		10000	/* Charger misc timer */
 #define CHARGER_TYPE		1000	/* Charger type detection after 1 second */
 #define CHARGER_TYPE_SUSPEND	5000	/* Charger detection after a system resume */
 #define CHARGER_TYPE_LPM	4000	/* Transition PHY into LPM after 10 seconds */
 #define PHY_LPM_TIMER		20000	/* 20 seconds after resume */
 #define THIRD_PARTY_DETECT	30000	/* Third Party charger detect */
 #define HOST_ENU_DETECT 	100	/* Host enumeration check */
-#define BATT_VOLTAGE_SCALE	4687	/* Scale the values from the ADC based on manual */
-#define BATT_CURRENT_SCALE	5865	/* Scale the current read from the ADC */
-#define CHARGE_VOLTAGE_SCALE	11700	/* Scale the charger voltage read from A/D */
-#define CHARGER_FULL		0x0	/* off - 0mA */
-#define CHARGING_HOST		0x1	/* Host charging with PHY active */
-#define CHARGING_WALL		0x5	/* Wall charging - */
-#define CHARGING_THIRD_PARTY	0x5	/* Third party chargers */
-#define BPSNS_VALUE		0x2	/* For LOBATHI and LOBATLI */
-#define BPSNS_VALUE_SUSPEND	0x3	/* Suspend - LOBATHI and LOBATLI */
-#define BPSNS_MASK		0x3	/* BPSNS Mask in PMIC reg 13 */
-#define BPSNS_VOLTAGE_THRESH	3600	/* 3.6V BPSNS threshold */
-#define PMIC_REG_PC_0		13	/* PMIC Register 13 */
-#define BPSNS_OFFSET		16	/* BPSNS OFFSET in Register 13 */
-#define GREEN_LED_THRESHOLD	95	/* Turn Charge LED to Green */
-#define BATTCYCL_THRESHOLD	4105	/* Restart charging if not done automatically */
-#define LOW_TEMP_CHARGING	0x2	/* 240mA charging if temp < 10C */
-#define CHRGLEDEN		18 	/* offset 18 in REG_CHARGE */
-#define CHRGCYCLB		22	/* BATTCYCL to restart charging at 95% full */
-#define CHRGRESTART		20	/* Restart charging */
-#define BPON_THRESHOLD		3800
-#define BPON_THRESHOLD_HI	3810
-#define CHARGING_BPON		0x3	/* 320mA charging */
-#define CHARGER_TURN_ON		3400
-#define CHRGRAW_THRESHOLD	6000
-#define CRAW_MON_THREHOLD	6 	/* Every 60 seconds or so, monitor the chrgraw */
 #define IDGND_SENSE		(1 << 20)
 #define CHRG_SUS_LOW_VOLTAGE	3420	/* 3.42V */
-#define CHRG_TIMER_THRESHOLD		2
-#define CHRG_TIMER_THRESHOLD_TEQ	1
 
-#define BIT_CHG_CURR_LSH	3
-#define BIT_CHG_CURR_WID	4
-
-#define BIT_CHG_CURRS_LSH 	11
-#define BIT_CHG_CURRS_WID	1
-
-#define BAT_TH_CHECK_DIS_LSH	9
-#define BAT_TH_CHECK_DIS_WID	1
-
-#define RESTART_CHG_STAT_LSH	20
-#define RESTART_CHG_STAT_WID	1
-
-#define AUTO_CHG_DIS_LSH	21
-#define AUTO_CHG_DIS_WID	1
-
-#define VI_PROGRAM_EN_LSH	23
-#define VI_PROGRAM_EN_WID	1
-
-/* Battery current amplification from A/D */
-#define BAT_CURRENT_UNIT_UA	5870
-
-#define CHARGER_BOOT_THRESHOLD	4
-
-#define FULL_BATTERY_CAPACITY	100
-#define FULL_BATTERY_CURR_LIMIT	20
-
-enum chg_setting {
-	BAT_TH_CHECK_DIS,
-	RESTART_CHG_STAT,
-	AUTO_CHG_DIS,
-	VI_PROGRAM_EN
-};
-
-static int pmic_set_chg_misc(enum chg_setting type, unsigned short flag);
-
-#define LOW_VOLTAGE_THRESHOLD		3400	/* 3.4V */
-#define CRITICAL_VOLTAGE_THRESHOLD	3100	/* 3.1V */
 #define PMIC_IRQ			108	/* PMIC IRQ */
 
-static int ichrg_value = 0;
-static int charger_bpon = 0;
-static int full_battery = 0;
-
 static atomic_t enumerated = ATOMIC_INIT(0);
-static int wall_charger = 0;
-static int third_party_charger = 0;	/* Is it a non-Amazon charger? */
 static int charger_enumerated = 0;
 static int charger_conn_probe = 0;	/* Is charger connected on probe? */
-static int chrgraw_disable = 0;		/* Is charging disabled due to chrgraw? */
-static int chrgraw_monitor = 0; 	/* Once every 60 seconds */
-
-static int bpsns_value = BPSNS_VALUE;	/* BPSNS = 0x3 at init */
-
-/* Battery Error Flags */
-extern int yoshi_battery_error_flags;
-
-static int read_supply_voltage(void);
-static int read_chrgraw_voltage(void);
-
-static void fsl_charger_type_detect(unsigned long data);
 
 static ssize_t
 show_connected(struct device *dev, struct device_attribute *attr, char *buf);
@@ -382,8 +257,6 @@ static void pmic_vusb2_enable(int enable)
 	pmic_vusb2_enable_vote(enable,VUSB2_VOTE_SOURCE_OTG);
 }
 
-static int read_charger_voltage(void);
-
 /********************************************************************
  *	Internal Used Function
 ********************************************************************/
@@ -426,42 +299,12 @@ static inline void dump_ep_queue(struct fsl_ep *ep)
 }
 #endif
 
-static int bvalid_connected(void)
+static void wall_charger_start_charging(void)
 {
-	int sense_0 = 0;
-	int ret = 0; /* Default: no charger */
+	printk(KERN_INFO "arcotg_udc: I pmic:chargerWall\n");
 
-	pmic_read_reg(REG_INT_SENSE0, &sense_0, 0xffffff);
-	if (sense_0 & BVALIDS)
-		ret = 1;
-
-	return ret;
-}
-
-/*
- * Is a USB charger connected?
- */
-static int charger_connected(void)
-{
-	int sense_0 = 0;
-	int ret = 0; /* Default: no charger */
+	charger_set_current_limit(charging_wall_mA);
 	
-	pmic_read_reg(REG_INT_SENSE0, &sense_0, 0xffffff);
-	if (sense_0 & CHGDETS)
-		ret = 1;
-
-	pr_debug("%s: %d\n", __func__, ret);
-
-	return ret;
-}
-
-static void charger_set_config(void)
-{
-	printk(KERN_INFO "arcotg_udc: I pmic:chargerWall:mV=%d:\n", read_supply_voltage());
-
-	pmic_start_charging(charging_wall_mA);
-	
-	wall_charger = 1;
 	kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 	if (device_create_file(udc_controller->gadget.dev.parent,
 			       &dev_attr_connected) < 0) {
@@ -469,21 +312,16 @@ static void charger_set_config(void)
 	}
 }
 
-static int check_portsc_bits(void)
+static int is_wall_charger_attached(void)
 {
-        unsigned int portsc1;
+	unsigned int portsc1;
 
 	resume_ctrl();
 	mdelay(10);
 
 	portsc1 = fsl_readl(&dr_regs->portsc1);
 
-	if ((portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_UNDEF) {
-		charger_set_config();
-		return 1;
-        }
-
-	return 0;
+	return (portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_UNDEF;
 }
 
 /*
@@ -494,419 +332,54 @@ static void do_charger_detect_work(struct work_struct *work)
 {
 	struct fsl_udc *udc = 
 		container_of(work, struct fsl_udc, charger_detect_work.work);
-	int charger_conn = charger_connected();
+	int charger_conn = is_charger_connected();
 
 	pr_debug("%s: begin\n", __func__);
 
-	if (charger_conn && yoshi_battery_valid()) {
-	    if (ichrg_value != 0) {
-		pr_debug("%s: detected chg=%d\n", __func__, ichrg_value);
+	if (charger_conn) {
+		if (!not_detected) {
+			pr_debug("%s: not detected prb=%d\n", __func__, charger_conn_probe);
 
-		/* Charger already detected */
-		atomic_set(&charger_atomic_detection, 1);
-
-	    } else if (!not_detected) {
-		pr_debug("%s: not detected prb=%d\n", __func__, charger_conn_probe);
-
-		atomic_set(&charger_atomic_detection, 1);
-		if (charger_conn_probe == 1) {
-		    charger_conn_probe = 0;
-		    if (!check_portsc_bits()) {
-			fsl_detect_charger_type();
-		    }
-		} else {
-		    fsl_detect_charger_type();
+			atomic_set(&charger_atomic_detection, 1);
+			if (charger_conn_probe == 1) {
+				charger_conn_probe = 0;
+				if (is_wall_charger_attached()) {
+					wall_charger_start_charging();
+				} else {
+					fsl_detect_charger_type();
+				}
+			} else {
+				fsl_detect_charger_type();
+			}
 		}
-	    } 
 	} else {
-	    pr_debug("No USB/Charger found ... entering low power idle\n");
-	    pmic_enable_green_led(0);
-	    fsl_idle_low_power_enter(udc);
+		pr_debug("No USB/Charger found ... entering low power idle\n");
+		fsl_idle_low_power_enter(udc);
 	}
-}
-
-static void pmic_green_led_disable(int flag)
-{
-	pmic_write_reg(REG_CHARGE, (flag << CHRGLEDEN), (1 << CHRGLEDEN));
-}
-
-static void pmic_enable_bpon_charging(void)
-{
-	/* Don't enable charging if there is no battery */
-	if (!yoshi_battery_valid()) {
-	    pr_debug("%s: no battery, do not enable charging\n", __func__);
-	    return;
-	}
-
-	/* Keep auto charging disabled */
-	pmic_set_chg_misc(AUTO_CHG_DIS, 1);
-
-        /* Turn on CHRGLED */
-	pmic_write_reg(REG_CHARGE, (1 << 18), (1 << 18));
-
-	/* Yellow LED GPIO */
-	gpio_chrgled_active(1);
-
-	/* Turn on V & I programming */
-	pmic_write_reg(REG_CHARGE, (1 << 23), (1 << 23));
-
-	/* Turn off TRICKLE CHARGE */
-	pmic_write_reg(REG_CHARGE, (0 << 7), (1 << 7));
-
-	if (host_detected == 1) {
-		if (!atomic_read(&enumerated)) {
-			pmic_set_chg_current(CHARGING_HOST);
-			ichrg_value = CHARGING_HOST;
-		}
-		else {
-			pmic_set_chg_current(charger_enumerated);
-			ichrg_value = charger_enumerated;
-		}
-	}
-	else {
-		if (!wall_charger) {
-			pmic_set_chg_current(CHARGING_THIRD_PARTY);
-			ichrg_value = CHARGING_THIRD_PARTY;
-		}
-		else {
-			pmic_set_chg_current(charging_wall_mA);
-			ichrg_value = charging_wall_mA;
-		}
-	}
-
-	/* PLIM: bits 15 and 16 */
-	pmic_write_reg(REG_CHARGE, (0x2 << 15), (0x3 << 15));
-
-	/* PLIMDIS: bit 17 */
-	pmic_write_reg(REG_CHARGE, (0 << 17), (1 << 17));
-
-	/* Restart charging */
-	pmic_write_reg(REG_CHARGE, (1 << 20), (1 << 20));
-}
-
-static void pmic_restart_charging(void)
-{
-    if (yoshi_battery_valid()) {
-	/* Restart the charging process */
-	pmic_write_reg(REG_CHARGE, (1 << CHRGRESTART), (1 << CHRGRESTART));
-    }
 }
 
 /*!
  * Post a low battery or a critical battery event to the userspace 
  */
-static void post_lobat_event(int crit_level)
+/* TODO: Ensure that this is actually called */
+static void callback_lobat_event(void *param)
 {
-	if (!yoshi_battery_valid())
+	if (!charger_have_low_battery())
 		return;
 
-	if (!crit_level) {
+	if (charger_have_critical_battery()) {
+		char *envp[] = { "BATTERY=critical", NULL };
+		printk(KERN_ERR "arcotg_udc: I pmic:critbatEvent::\n");
+
+		/* Relay the lobatl event to userspace */
+		kobject_uevent_env(&udc_controller->gadget.dev.parent->kobj, KOBJ_CHANGE, envp);
+	} else {
 		char *envp[] = { "BATTERY=low", NULL };
 		printk(KERN_INFO "arcotg_udc: I pmic:lowbatEvent::\n");
 
 		/* Relay the lobath event to userspace */
 		kobject_uevent_env(&udc_controller->gadget.dev.parent->kobj, KOBJ_CHANGE, envp);
 	}
-	else {
-		char *envp[] = { "BATTERY=critical", NULL };
-		printk(KERN_ERR "arcotg_udc: I pmic:critbatEvent::\n");
-
-		/* Relay the lobatl event to userspace */
-		kobject_uevent_env(&udc_controller->gadget.dev.parent->kobj, KOBJ_CHANGE, envp);
-	}
-
-	/* Update the /sys entry */
-	lobat_condition = 1;
-}
-
-static void do_charger_misc_work(struct work_struct *work);
-DECLARE_DELAYED_WORK(charger_misc_work, do_charger_misc_work);
-
-static int reduce_charging = 0;
-static int battery_error = 0;
-
-
-/*!
- * This function checks the charger over-voltage condition
- */
-static void fsl_check_overvoltage(int charger_conn)
-{
-	unsigned int chrgraw = 0;
-
-	/* Clear out the chrgraw monitor */
-	chrgraw_monitor = 0;
-	chrgraw = read_charger_voltage();
-
-	if (!chrgraw_disable) {
-		if (chrgraw >= CHRGRAW_THRESHOLD) {
-			pr_debug("overvoltage\n");
-			pmic_set_chg_current(0);
-			saved_ichrg_value = ichrg_value;
-			ichrg_value = 0; /* Userspace can suspend */
-			chrgraw_disable = 1;
-		}
-	}
-	else {
-		/* Check charger voltage and restart charging */
-		if (chrgraw < CHRGRAW_THRESHOLD) {
-			if (saved_ichrg_value) {
-				ichrg_value = saved_ichrg_value;
-
-				/* Charging was disabled earlier due to chrgraw > 6V */
-				pmic_set_chg_current(saved_ichrg_value);
-				pmic_restart_charging();
-			}
-			else
-				fsl_detect_charger_type();
-
-			chrgraw_disable = 0;
-		}
-		else {
-			/* Charger disable from callback with an ichrg value */
-			if (ichrg_value) {
-				pmic_set_chg_current(0);
-				saved_ichrg_value = ichrg_value;
-				ichrg_value = 0; /* Userspace can suspend */
-				chrgraw_disable = 1;
-			}
-		}
-	}
-}
-
-static int charger_check_full_battery(void)
-{
-	if ( (yoshi_battery_capacity == FULL_BATTERY_CAPACITY) &&
-		(yoshi_battery_current <= FULL_BATTERY_CURR_LIMIT) )
-			return 1;
-	
-	return 0;
-}
-
-/*
- * Do all the miscellaneous activities like lobat checking and led setting
- */
-static void do_charger_misc_work(struct work_struct *work)
-{
-	int batt_voltage = read_supply_voltage();
-	int charger_conn = charger_connected();
-	int sense_0 = 0;
-
-	pr_debug("%s: begin\n", __func__);
-
-	if (udc_suspended_mode) {
-	    pr_debug("%s: suspended\n", __func__);
-	    return;
-	}
-
-	chrgraw_monitor++;
-
-	if (!yoshi_battery_valid()) {
-
-	    pr_debug("%s: no battery\n", __func__);
-	    
-	    if (charger_conn && ichrg_value) {
-		pmic_set_chg_current(0);
-		saved_ichrg_value = 0;
-		ichrg_value = 0;
-	    }
-	    
-	    /* Disable all LEDs */
-	    pmic_enable_green_led(0);
-	    pmic_green_led_disable(0);
-	    gpio_chrgled_active(0);
-	    
-	    return;
-	}
-
-	if (!charger_conn && (batt_voltage <= CRITICAL_VOLTAGE_THRESHOLD)) {
-	    
-		pr_debug("%s: critical battery\n", __func__);
-
-		post_lobat_event(1);
-		goto done;
-	}
-
-	if (!charger_conn && (batt_voltage <= LOW_VOLTAGE_THRESHOLD)) {
-
-		pr_debug("%s: low battery\n", __func__);
-
-		post_lobat_event(0);
-		goto done;
-	}
-
-	if (crit_boot_flag  && (yoshi_battery_capacity > CHARGER_BOOT_THRESHOLD)) {
-		crit_boot_flag = 0;
-		pmic_write_reg(REG_MEM_A, (0 << 4), (1 << 4));
-	}
-
-	if (yoshi_battery_error_flags) {
-
-		pr_debug("%s: battery error\n", __func__);
-
-		pmic_set_chg_current(0);
-		saved_ichrg_value = ichrg_value;
-		ichrg_value = 0;
-		battery_error = 1;
-
-		/* Disable all LEDs */
-		pmic_enable_green_led(0);
-		pmic_green_led_disable(0);
-		gpio_chrgled_active(0);
-		goto done;
-	}
-
-	if (battery_error && !yoshi_battery_error_flags && charger_conn) {
-		ichrg_value = saved_ichrg_value;
-		battery_error = 0;
-		pmic_set_chg_current(ichrg_value);
-		pmic_green_led_disable(1);
-		gpio_chrgled_active(1);
-	}
-
-	if ( (chrgraw_monitor == CRAW_MON_THREHOLD) && charger_conn) {
-		pr_debug("%s: chrgraw monitor\n", __func__);
-	    
-		fsl_check_overvoltage(charger_conn);
-	}
-
-	if (chrgraw_disable) {
-		pr_debug("%s: chrgraw disabled\n", __func__);
-
-		goto done;
-	}
-
-	if (charger_conn && fsl_vbus_done) {
-		pr_debug("%s: vbus done\n", __func__);
-		fsl_vbus_done = 0;
-		pmic_set_chg_current(ichrg_value);
-	}
-
-	/* TEQ-7477 - don't reenable charging if the timer expired */
-	if (charger_conn &&
-	    (charger_timer_expiry_counter > charger_timer_expiry_threshold)) {
-		pr_debug ("%s: charge timer expired! do not resume charging\n", __func__);
-		goto done;
-
-	}
-
-	if (charger_conn && (batt_voltage <= CHARGER_TURN_ON)) {
-		pr_debug("%s: restart charging (voltage)\n", __func__);
-		pmic_restart_charging();
-	}
-
-	/*
-	 * Keep BPSNS to the lowest value "00" for higher charge
-	 * current. However, if charger is not connected, then 
-	 * we need BPSNS to be "11" for LOBATL and LOBATH
-	 */
-	if (charger_conn && (batt_voltage > BPSNS_VOLTAGE_THRESH)) {
-		/* Try to charge at higher current */
-		if (bpsns_value != 0) {
-			bpsns_value = 0;
-			pmic_write_reg(PMIC_REG_PC_0, bpsns_value << BPSNS_OFFSET,
-					BPSNS_MASK << BPSNS_OFFSET);
-		}
-	}
-	else {
-		if (bpsns_value != BPSNS_VALUE) {
-			bpsns_value = BPSNS_VALUE;
-			pmic_write_reg(PMIC_REG_PC_0, bpsns_value << BPSNS_OFFSET,
-					BPSNS_MASK << BPSNS_OFFSET);
-		}
-	}
-
-	if (charger_conn && (batt_voltage <= BPON_THRESHOLD)) {
-		if (!charger_bpon) {
-			printk(KERN_INFO "arcotg_udc: I pmic:bponLobat:mV=%d:\n", batt_voltage);
-			/* BPON charging */
-			pmic_enable_bpon_charging();
-			charger_bpon = 1;
-		}
-		goto done;
-	}
-
-	if (charger_bpon && (batt_voltage > BPON_THRESHOLD_HI)) {
-		printk(KERN_INFO "arcotg_udc: I pmic:bponHi:mV=%d\n", batt_voltage);
-		if (host_detected == 0) {
-			if (!wall_charger)
-				pmic_start_charging(CHARGING_THIRD_PARTY);
-			else
-				pmic_start_charging(charging_wall_mA);
-                }
-		else {
-			if (!atomic_read(&enumerated))
-				pmic_start_charging(CHARGING_HOST);
-			else
-				pmic_start_charging(charger_enumerated);
-		}
-
-		charger_bpon = 0;
-	}
-
-	if (charger_conn) {
-		if (yoshi_battery_capacity > GREEN_LED_THRESHOLD) {
-			if (!green_led_set) {
-				green_led_set = 1;
-
-				/* set the green led parameters */
-				pmic_enable_green_led(1);
-
-				/* set the chrgleden to 0 */
-				pmic_green_led_disable(0);
-
-				/* turn off the charger led */
-				gpio_chrgled_active(0);
-			}
-		}
-		else {
-			green_led_set = 0;
-
-			/* turn off the green led */
-			pmic_enable_green_led(0);
-
-			/* now enable the chrgleden to turn on the yellow LED */
-			pmic_green_led_disable(1);
-
-			/* turn back the charger led */
-			gpio_chrgled_active(1);
-		}
-	}
-
-	/* Check for full battery conditions */
-	if (!full_battery && charger_conn) {
-		pmic_read_reg(REG_INT_SENSE0, &sense_0, 0xffffff);
-		if ( (!(sense_0 & CHGCURRS) && (batt_voltage > CHGCURRS_THRESHOLD) ) ||
-			charger_check_full_battery() ) {
-			full_battery = 1;
-			printk(KERN_INFO "arcotg_udc: I pmic:batteryFull::\n");
-			saved_ichrg_value = ichrg_value;
-			pmic_set_chg_current(CHARGER_FULL);
-		}
-	}
-
-	if (full_battery && charger_conn) {
-		if (batt_voltage < BATTCYCL_THRESHOLD) {
-			pmic_set_chg_current(saved_ichrg_value);
-			pmic_restart_charging();
-			full_battery = 0;
-		}
-	}
-
-	if (yoshi_reduce_charging && charger_conn) {
-		reduce_charging = 1;
-		saved_ichrg_value = ichrg_value;
-		pmic_set_chg_current(LOW_TEMP_CHARGING);
-		ichrg_value = LOW_TEMP_CHARGING;
-	}
-
-	if (reduce_charging && !yoshi_reduce_charging && charger_conn) {
-		reduce_charging = 0;
-		ichrg_value = saved_ichrg_value;
-		pmic_set_chg_current(ichrg_value);
-	}
-
-done:
-	schedule_delayed_work(&charger_misc_work, msecs_to_jiffies(CHARGER_MISC));
 }
 
 /*-----------------------------------------------------------------
@@ -2022,6 +1495,10 @@ static int fsl_vbus_session(struct usb_gadget *gadget, int is_active)
 	return 0;
 }
 
+static void do_charge_current_work(struct work_struct *work) {
+	charger_set_current_limit(current_limit);
+}
+
 /* constrain controller's VBUS power usage
  * This call is used by gadget drivers during SET_CONFIGURATION calls,
  * reporting how much power the device may consume.  For example, this
@@ -2031,14 +1508,12 @@ static int fsl_vbus_session(struct usb_gadget *gadget, int is_active)
  */
 static int fsl_vbus_draw(struct usb_gadget *gadget, unsigned mA)
 {
-	struct fsl_udc *udc;
-
-	udc = container_of(gadget, struct fsl_udc, gadget);
-	ichrg_value = mA;
 	atomic_set(&enumerated, 1);
-	charger_enumerated = mA;
-	third_party_charger = 0;
-	fsl_vbus_done = 1;
+	charger_enumerated = 1;
+
+	/* may be called out of interrupt context, so set the charge current later */
+	current_limit = mA;
+	schedule_work(&charge_current_work);
 	return 0;
 }
 
@@ -2639,18 +2114,15 @@ static void dtd_complete_irq(struct fsl_udc *udc)
 /* Late check to make sure, the device got enumerated */
 static void port_change_work(struct work_struct *work)
 {
-	/* If device already enumerated, return. */
-	if (charger_connected() && (udc_controller->gadget.speed != USB_SPEED_UNKNOWN)
-			&& (udc_controller->gadget.configured) ) {
+	if (!is_charger_connected())
 		return;
+
+	if ((udc_controller->gadget.speed == USB_SPEED_UNKNOWN)
+			|| (!udc_controller->gadget.configured) ) {
+		fsl_udc_redo_enumerate();
 	}
 
-	/* No charger, so return */
-	if (!charger_connected())
-		return;
 
-	/* Re-enumerate */
-	fsl_udc_redo_enumerate();
 }
 
 /* Process a port change interrupt */
@@ -3401,7 +2873,7 @@ show_accessory_charger(struct device *dev, struct device_attribute *attr, char *
 static ssize_t
 show_connected(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	if (charger_connected())
+	if (is_charger_connected())
 		return sprintf(buf, "1\n");
 	else
 		return sprintf(buf, "0\n");
@@ -3410,23 +2882,13 @@ show_connected(struct device *dev, struct device_attribute *attr, char *buf)
 static ssize_t
 show_supply_voltage(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	int batt_voltage = read_supply_voltage();
-
-	if (batt_voltage < 0)
-		return sprintf(buf, "0\n");
-	else
-		return sprintf(buf, "%d\n", batt_voltage);
+	return -ENOSYS;
 }
 
 static ssize_t
 show_chrgraw_voltage(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	int chrgraw_voltage = read_chrgraw_voltage();
-	
-	if (chrgraw_voltage < 0)
-		return sprintf(buf, "0\n");
-	else
-		return sprintf(buf, "%d\n", chrgraw_voltage);
+	return -ENOSYS;
 }
 
 /*
@@ -3435,12 +2897,7 @@ show_chrgraw_voltage(struct device *dev, struct device_attribute *attr, char *bu
 static ssize_t
 show_voltage(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	int batt_voltage = read_supply_voltage();
-
-	if (batt_voltage < 0)
-		return sprintf(buf, "0\n");
-	else
-		return sprintf(buf, "%d\n", batt_voltage);
+	return show_supply_voltage(dev, attr, buf);
 }
 
 /*
@@ -3449,7 +2906,7 @@ show_voltage(struct device *dev, struct device_attribute *attr, char *buf)
 static ssize_t
 show_bpsns(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", bpsns_value);
+	return -ENOSYS;
 }
 
 /*
@@ -3458,22 +2915,10 @@ show_bpsns(struct device *dev, struct device_attribute *attr, char *buf)
 static ssize_t
 show_charging(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	if (charger_connected() && (ichrg_value > 1) )
+	if (charger_get_charge_current() > 1)
 		return sprintf(buf, "1\n");
 	else
 		return sprintf(buf, "0\n");
-}
-
-static int pmic_get_batt_current(unsigned short *curr)
-{
-	t_channel channel;
-	unsigned short result[8];
-
-	channel = BATTERY_CURRENT;
-	CHECK_ERROR(pmic_adc_convert(channel, result));
-	*curr = result[0];
-
-	return 0;
 }
 
 /*!
@@ -3482,7 +2927,7 @@ static int pmic_get_batt_current(unsigned short *curr)
 static ssize_t
 show_lobat_condition(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", lobat_condition);
+	return sprintf(buf, "%d\n", charger_have_low_battery());
 }
 
 /*
@@ -3491,20 +2936,13 @@ show_lobat_condition(struct device *dev, struct device_attribute *attr, char *bu
 static ssize_t
 show_battery_current(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	unsigned short current_raw = 0;
-	int current_uA = 0;
-	int status = pmic_get_batt_current(&current_raw);
+	int battery_current_uA;
+	int status = charger_get_battery_current(&battery_current_uA);
 
 	if (status < 0)
 		return sprintf(buf, "0\n");
-	else {
-		if (current_raw & 0x200)
-			current_uA = (0x1FF - (current_raw & 0x1FF)) * BAT_CURRENT_UNIT_UA * (-1);
-		else
-			current_uA = current_raw & 0x1FF * BAT_CURRENT_UNIT_UA;
-
-		return sprintf(buf, "%d\n", current_uA);
-	}
+	else
+		return sprintf(buf, "%d\n", battery_current_uA);
 }
 
 /*
@@ -3513,7 +2951,7 @@ show_battery_current(struct device *dev, struct device_attribute *attr, char *bu
 static ssize_t
 show_batt_error(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", yoshi_battery_error_flags);
+	return sprintf(buf, "%d\n", 0);
 }
 
 /*!
@@ -3522,7 +2960,7 @@ show_batt_error(struct device *dev, struct device_attribute *attr, char *buf)
 static ssize_t
 show_battery_id(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", yoshi_battery_id);
+	return -ENOSYS;
 }
 
 /*!
@@ -3531,7 +2969,7 @@ show_battery_id(struct device *dev, struct device_attribute *attr, char *buf)
 static ssize_t
 show_third_party(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", third_party_charger);
+	return -ENOSYS;
 }
 
 /*
@@ -3540,175 +2978,21 @@ show_third_party(struct device *dev, struct device_attribute *attr, char *buf)
 static ssize_t
 show_ichrg_setting(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", ichrg_value);
-}
-
-static void pmic_enable_green_led(int enable)
-{
-	if (enable == 1) {
-		mc13892_bklit_set_current(LIT_KEY, 0x7);
-		mc13892_bklit_set_ramp(LIT_KEY, 0);
-		mc13892_bklit_set_dutycycle(LIT_KEY, 0x3f);
-	}
-	else {
-		mc13892_bklit_set_current(LIT_KEY, 0);
-		mc13892_bklit_set_dutycycle(LIT_KEY, 0);
-	}
-}
-
-static int pmic_set_chg_current(unsigned short curr)
-{
-	unsigned int mask;
-	unsigned int value;
-
-	/* If we have no battery, charging must be shut off unless in factory mode */
-	if (!yoshi_battery_valid() && !pmic_check_factory_mode()) {
-	    pr_debug("%s: no battery, disable charging\n", __func__);
-	    curr = 0;
-	}	
-
-	value = BITFVAL(BIT_CHG_CURR, curr);
-	mask = BITFMASK(BIT_CHG_CURR);
-	CHECK_ERROR(pmic_write_reg(REG_CHARGE, value, mask));
-
-	return 0;
-}
-
-static int pmic_set_chg_misc(enum chg_setting type, unsigned short flag)
-{
-	unsigned int reg_value = 0;
-	unsigned int mask = 0;
-
-	switch (type) {
-	case BAT_TH_CHECK_DIS:
-		reg_value = BITFVAL(BAT_TH_CHECK_DIS, flag);
-		mask = BITFMASK(BAT_TH_CHECK_DIS);
-		break;
-	case RESTART_CHG_STAT:
-		reg_value = BITFVAL(RESTART_CHG_STAT, flag);
-		mask = BITFMASK(RESTART_CHG_STAT);
-		break;
-	case AUTO_CHG_DIS:
-		reg_value = BITFVAL(AUTO_CHG_DIS, flag);
-		mask = BITFMASK(AUTO_CHG_DIS);
-		break;
-	case VI_PROGRAM_EN:
-		reg_value = BITFVAL(VI_PROGRAM_EN, flag);
-		mask = BITFMASK(VI_PROGRAM_EN);
-		break;
-	default:
-		return PMIC_PARAMETER_ERROR;
-	}
-
-	CHECK_ERROR(pmic_write_reg(REG_CHARGE, reg_value, mask));
-	return 0;
-}
-
-static void pmic_start_charging(int value)
-{
-	/* Don't enable charging if we're in factory mode */
-	if (pmic_check_factory_mode() && !yoshi_battery_valid()) {
-	    pr_debug("%s: factory mode, do not enable charging\n", __func__);
-	    return;
-	}
-
-	/* Battery thermistor check disable */
-	pmic_set_chg_misc(BAT_TH_CHECK_DIS, 1);
-	
-	/* Keep auto charging enabled */
-	pmic_set_chg_misc(AUTO_CHG_DIS, 0);
-	
-	/* Allow programming of charge voltage and current */
-	pmic_set_chg_misc(VI_PROGRAM_EN, 1);
-
-	/* Set the ichrg */
-	pmic_set_chg_current(value);
-	ichrg_value = value;
-
-	/* Turn off CYCLB disable */	
-	pmic_write_reg(REG_CHARGE, (0 << CHRGCYCLB), (1 << CHRGCYCLB));
-
-	/* PLIM: bits 15 and 16 */
-	pmic_write_reg(REG_CHARGE, (0x2 << 15), (0x3 << 15));
-
-	/* PLIMDIS: bit 17 */
-	pmic_write_reg(REG_CHARGE, (0 << 17), (1 << 17));
-
-	/* Start the charger state machine */
-	pmic_set_chg_misc(RESTART_CHG_STAT, 1);
-}
-
-/*
- * Dynamically enable/disable the charger even if the charge
- * cable is connected.
- */
-static void fsl_charger_enable(int enable)
-{
-	if (enable) {
-		/*
-		 * Check if charger is connected and if ichrg is set to 0
-	 	 */
-		if (!pmic_check_factory_mode() && charger_connected() && !ichrg_value) {
-			pmic_start_charging(charging_wall_mA);
-			schedule_delayed_work(&charger_misc_work, msecs_to_jiffies(CHARGER_MISC));
-		}
-		udc_suspended_mode = 0;
-	}
-	else {
-		/* Fake a suspended mode state so that timer does not run */
-		udc_suspended_mode = 1;
-
-		full_battery = 0;
-
-		/* Set the ichrg to 0 */
-		pmic_set_chg_current(0);
-		ichrg_value = 0;
-
-		/* Clear the charger timer counter */
-		charger_timer_expiry_counter = 0;
-
-		/* Shut off the green LED */
-		pmic_enable_green_led(0);
-
-		/* Clear out saved ichrg value */
-		saved_ichrg_value = 0;
-
-		/* Shut off the CHRGLEDEN bit */
-		pmic_green_led_disable(0);
-
-		/* Clear the green LED flag */
-		green_led_set = 0;
-
-		atomic_set(&enumerated, 0);
-
-		/* Clear out the variables */
-		third_party_charger = 0;
-		charger_bpon = 0;
-		wall_charger = 0;
-		charger_conn_probe = 0;
-		charger_enumerated = 0;
-	}
+	return sprintf(buf, "%d\n", charger_get_charge_current());
 }
 
 /* Third party detect timer */
 static ssize_t
 show_third_party_timer(struct device *_dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", third_party_detect_timer);
+	return -ENOSYS;
 }
 
 static ssize_t
 store_third_party_timer(struct device *_dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
-	int value;
-
-	if ( (sscanf(buf, "%d", &value) > 0) ) {
-		third_party_detect_timer = value;
-		return strlen(buf);
-	}
-
-	return -EINVAL;
+	return -ENOSYS;
 }
 static DEVICE_ATTR (third_party_timer, S_IRUGO|S_IWUSR, show_third_party_timer, store_third_party_timer);
 
@@ -3739,8 +3023,7 @@ static DEVICE_ATTR (usb_lpm_timer_threshold, S_IRUGO|S_IWUSR, show_usb_lpm_timer
 static ssize_t
 show_charger_state(struct device *_dev, struct device_attribute *attr, char *buf)
 {
-	/* ichrg_value is 0 if not charging */
-	return sprintf(buf, "%d\n", ichrg_value);
+	return sprintf(buf, "%d\n", charger_get_charge_current());
 }
 
 static ssize_t
@@ -3751,8 +3034,10 @@ store_charger_state(struct device *_dev, struct device_attribute *attr,
 
 	if ((sscanf(buf, "%d", &value) > 0) &&
 			((value == 0) || (value == 1))) {
-		fsl_charger_enable(value);
-		return strlen(buf);
+		/* Well, we could implement this, but setting the charge current manually seems
+		 * like a bad thing to do
+		 */
+		return -ENOSYS;
 	}
 
 	return -EINVAL;
@@ -3767,25 +3052,12 @@ store_chrgled_state(struct device *_dev, struct device_attribute *attr,
 
 	if ((sscanf(buf, "%d", &value) > 0) &&
 		((value == 0) || (value == 1))) {
-			gpio_chrgled_active(value);
-			return strlen(buf);
+			return -ENOSYS;
 	}
 
 	return -EINVAL;
 }
 static DEVICE_ATTR (chrgled_state, S_IRUGO|S_IWUSR, NULL, store_chrgled_state);
-
-static void fsl_charger_lobath_unsubscribe(int value)
-{
-	if (!value) {
-		pmic_event_subscribe(EVENT_LOBATLI, lobatli_event);
-		pmic_event_subscribe(EVENT_LOBATHI, lobathi_event);
-	}
-	else {
-		pmic_event_unsubscribe(EVENT_LOBATLI, lobatli_event);
-		pmic_event_unsubscribe(EVENT_LOBATHI, lobathi_event);
-	}
-}
 
 static ssize_t
 store_charger_lobath_unsub(struct device *_dev, struct device_attribute *attr,
@@ -3795,8 +3067,7 @@ store_charger_lobath_unsub(struct device *_dev, struct device_attribute *attr,
 
 	if ((sscanf(buf, "%d", &value) > 0) &&
 		((value == 0) || (value == 1))) {
-			fsl_charger_lobath_unsubscribe(value);
-			return strlen(buf);
+			return -ENOSYS;
 	}
 
 	return -EINVAL;
@@ -3804,27 +3075,11 @@ store_charger_lobath_unsub(struct device *_dev, struct device_attribute *attr,
 
 static DEVICE_ATTR (charger_lobath_unsub, S_IRUGO|S_IWUSR, NULL, store_charger_lobath_unsub);
 
-/*! Third party charging */
-static void third_party_detect(struct work_struct *work)
-{
-	char *envp[] = { "CHARGER=thirdparty", NULL };
-
-	if (!atomic_read(&enumerated) && charger_connected() && !wall_charger) {
-		printk(KERN_INFO "arcotg_udc: I pmic:charger3rdParty:mV=%d:\n", read_supply_voltage());
-		pmic_start_charging(CHARGING_THIRD_PARTY);
-		third_party_charger = 1;
-		/* Relay the event to userspace */
-		kobject_uevent_env(&udc_controller->gadget.dev.parent->kobj, KOBJ_CHANGE, envp);
-	}
-}
-
-static DECLARE_DELAYED_WORK(third_party_work, third_party_detect);
-
 /*! Failure of enumeration should redo detach/attach event */
 static void host_enumeration_detect_fn(struct work_struct *work)
 {
 	/* If not enumerated and connected to a HOST */
-	if (!atomic_read(&enumerated) && charger_connected())
+	if (!atomic_read(&enumerated) && is_charger_connected())
 		fsl_udc_redo_enumerate();
 }
 
@@ -3834,36 +3089,33 @@ static void fsl_detect_charger_type(void)
 {
 	unsigned int portsc1;
 
-	portsc1 = fsl_readl(&dr_regs->portsc1);
-
-	pr_debug("%s: prtsc1=0x%x\n", __func__, portsc1);
-
 	if (charger_conn_probe) {
 
-	    	pr_debug("%s: charger conn\n", __func__);
+		pr_debug("%s: charger conn\n", __func__);
 
 		resume_ctrl();
 		mdelay(10);
 		charger_conn_probe = 0;
-		if ((portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_UNDEF) {
-			charger_set_config();
+		if (is_wall_charger_attached()) {
+			wall_charger_start_charging();
 		}
 		return;
 	}
 
 	portsc1 = fsl_readl(&dr_regs->portsc1);
+	pr_debug("%s: prtsc1=0x%x\n", __func__, portsc1);
 
 	if ((portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_UNDEF) {
 	    	pr_debug("%s: line undef prtsc1=0x%x\n", __func__, portsc1);
 
-		charger_set_config();
+		wall_charger_start_charging();
 		goto out;
 	}
 
 	if ((portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_KSTATE ||
 	    (portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_JSTATE) {
 		pr_debug("Connected to a charger: 0x%x\n", portsc1);
-		pmic_start_charging(CHARGING_HOST);
+		charger_set_current_limit(CHARGING_HOST);
 		
 		kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 		if (device_create_file(udc_controller->gadget.dev.parent,
@@ -3871,8 +3123,6 @@ static void fsl_detect_charger_type(void)
 			printk(KERN_ERR "Host: Error creating device file\n");
 
 		fsl_udc_redo_enumerate();
-
-		schedule_delayed_work(&third_party_work, msecs_to_jiffies(third_party_detect_timer ));
 		goto out;
 	}
 
@@ -3887,7 +3137,7 @@ static void fsl_detect_charger_type(void)
 		}
 
 		if (!atomic_read(&enumerated))
-			pmic_start_charging(CHARGING_HOST);
+			charger_set_current_limit(CHARGING_HOST);
 
 		kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 		if (device_create_file(udc_controller->gadget.dev.parent,
@@ -3899,23 +3149,22 @@ static void fsl_detect_charger_type(void)
 	}
 
 	if (host_detected) {
-                /* A host as already been detected */
-                pr_debug("Connected to a Host: %d\n", host_detected);
-                pmic_start_charging(CHARGING_HOST);
+		/* A host as already been detected */
+		pr_debug("Connected to a Host: %d\n", host_detected);
+		charger_set_current_limit(CHARGING_HOST);
 
-                kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
-                if (device_create_file(udc_controller->gadget.dev.parent,
-                                &dev_attr_connected) < 0)
-                        printk(KERN_ERR "Host: Error creating device file\n");
-
-		goto out;
-        } else {
-		pr_debug("Connected to a third-party charger: 0x%x\n", portsc1);
-		pmic_start_charging(CHARGING_THIRD_PARTY);
-		third_party_charger = 1;
 		kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 		if (device_create_file(udc_controller->gadget.dev.parent,
-					&dev_attr_connected) < 0)
+				&dev_attr_connected) < 0)
+			printk(KERN_ERR "Host: Error creating device file\n");
+
+		goto out;
+	} else {
+		pr_debug("Connected to a third-party charger: 0x%x\n", portsc1);
+		charger_set_current_limit(CHARGING_THIRD_PARTY);
+		kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
+		if (device_create_file(udc_controller->gadget.dev.parent,
+				&dev_attr_connected) < 0)
 			printk(KERN_ERR "Charger: Error creating device file\n");
 		goto out;
 	}
@@ -3933,114 +3182,51 @@ static void phy_lpm_work(struct work_struct *unused)
 {
     pr_debug("%s: begin\n", __func__);
 
-    if (!charger_connected()) {
-	fsl_idle_low_power_enter(udc_controller);
+    if (!is_charger_connected()) {
+    	fsl_idle_low_power_enter(udc_controller);
     }
 }
 DECLARE_DELAYED_WORK(phy_lpm_worker, phy_lpm_work);
 
-static void do_bvalid_detect(struct work_struct *work)
+static void callback_charger_event(void *param)
 {
-	if (bvalid_connected()) {
-		pr_debug("%s: connected\n", __func__);
+	struct fsl_udc *udc = (struct fsl_udc *) param;
+	int chg_state = is_charger_connected();
+
+	if (chg_state) {
+		/* charger already detected? */
+		if (atomic_read(&charger_atomic_detection) == 1)
+			return;
+
+		atomic_set(&charger_atomic_detection, 1);
+
+		fsl_idle_low_power_exit(udc);
 
 		fsl_detect_charger_type();
-		if (!green_led_set)
-			gpio_chrgled_active(1);
-	}
-	else {
+	} else {
+		if (atomic_read(&charger_atomic_detection) == 0)
+			return;
+
+		atomic_set(&charger_atomic_detection, 0);
+
 		host_detected = 0;
-		ichrg_value = 0;
-		green_led_set = 0;
-		pmic_enable_green_led(0);
-		gpio_chrgled_active(1);
-		pmic_set_chg_current(0);
-		
 		pr_debug("%s: disconnect\n", __func__);
+		
+		if (udc->driver && udc->driver->disconnect)
+			udc->driver->disconnect(&udc->gadget);
 
-		/* Clear out saved ichrg value */
-		saved_ichrg_value = 0;
+		device_remove_file(udc->gadget.dev.parent, &dev_attr_connected);
+		kobject_uevent_atomic(&udc->gadget.dev.parent->kobj, KOBJ_REMOVE);
 
 		/* Clear out the variables */
 		atomic_set(&enumerated, 0);
-		third_party_charger = 0;
-		charger_bpon = 0;
-		wall_charger = 0;
 		charger_conn_probe = 0;
 		charger_enumerated = 0;
-		full_battery = 0;
-
-		/* Clear the charger timer counter */
-		charger_timer_expiry_counter = 0;
-		pmic_write_reg(REG_MEM_A, (0 << 4), (1 << 4));
 
 		/* Now, schedule a delayed workqueue to put PHY into LPM */
 		schedule_delayed_work(&phy_lpm_worker,
 				msecs_to_jiffies(usb_lpm_timer));
-
-		chrgraw_monitor = 0;
-		chrgraw_disable = 0;
 	}
-}
-
-DECLARE_WORK(bvalid_detect_work, do_bvalid_detect);
-
-static void fsl_bvalid_type_detect(unsigned long data)
-{
-	schedule_work(&bvalid_detect_work);
-}
-static void do_charger_detect(struct work_struct *work)
-{
-    pr_debug("%s: begin\n", __func__);
-
-	if (charger_connected()) {
-	    pr_debug("%s: charger connected!\n", __func__);
-
-	    fsl_detect_charger_type();
-	    if (!green_led_set)
-		gpio_chrgled_active(1);
-	}
-	else {
-
-		pr_debug("%s: no charger connected!\n", __func__);
-
-		host_detected = 0;
-		ichrg_value = 0;
-		green_led_set = 0;
-		pmic_enable_green_led(0);
-		gpio_chrgled_active(1);
-		pmic_set_chg_current(0);
-
-		/* Clear out saved ichrg value */
-		saved_ichrg_value = 0;
-
-		/* Clear out the variables */
-		atomic_set(&enumerated, 0);
-		third_party_charger = 0;
-		charger_bpon = 0;
-		wall_charger = 0;
-		charger_conn_probe = 0;
-		charger_enumerated = 0;
-		full_battery = 0;
-
-		/* Clear the charger timer counter */
-		charger_timer_expiry_counter = 0;
-		pmic_write_reg(REG_MEM_A, (0 << 4), (1 << 4));
-
-		/* Now, schedule a delayed workqueue to put PHY into LPM */
-		schedule_delayed_work(&phy_lpm_worker,
-				msecs_to_jiffies(usb_lpm_timer));
-
-		chrgraw_monitor = 0;
-		chrgraw_disable = 0;
-	}
-}
-
-DECLARE_WORK(charger_detect_work, do_charger_detect);
-
-static void fsl_charger_type_detect(unsigned long data)
-{
-	schedule_work(&charger_detect_work);
 }
 
 extern void mx50_anadig_clr(void);
@@ -4132,292 +3318,10 @@ static void fsl_idle_low_power_enter(struct fsl_udc *udc)
 
 	mx50_anadig_clr();
 
-	if (!charger_connected()) {
+	if (!is_charger_connected()) {
 		/* Enable accessory charging */
 		accessory_charger_enable();
 	}
-}
-
-static void callback_bvalid_detect(void *param)
-{
-	struct fsl_udc *udc = (struct fsl_udc *)param;
-
-	if (bvalid_connected()) {
-		if (yoshi_battery_error_flags)
-			return;
-
-		/* charger already detected */
-		if (atomic_read(&charger_atomic_detection) == 1)
-			return;
-
-		atomic_set(&charger_atomic_detection, 1);
-
-		fsl_idle_low_power_exit(udc);
-	}
-	else {
-		if (atomic_read(&charger_atomic_detection) == 0)
-			return;
-
-		atomic_set(&charger_atomic_detection, 0);
-
-		if (udc->driver && udc->driver->disconnect)
-			udc->driver->disconnect(&udc->gadget);
-
-		device_remove_file(udc->gadget.dev.parent, &dev_attr_connected);
-
-		kobject_uevent_atomic(&udc->gadget.dev.parent->kobj, KOBJ_REMOVE);
-	}
-
-	if (udc_stopped) {
-		udc_stopped = 0;
-
-		mod_timer(&udc->bvalid_detect_timer,
-			jiffies + (msecs_to_jiffies(CHARGER_TYPE_SUSPEND)));
-	}
-	else
-		mod_timer(&udc->bvalid_detect_timer,
-			jiffies + (msecs_to_jiffies(CHARGER_TYPE)));
-}
-
-/*
- * Charger callback from Atlas
- */
-static void callback_charger_detect(void *param)
-{
-	struct fsl_udc *udc = (struct fsl_udc *)param;
-
-	/*
-	 * Exit the low power mode before the detection is done
-	 */	
-	if (charger_connected()) {
-		if (yoshi_battery_error_flags)
-			return;
-
-		if (atomic_read(&charger_atomic_detection) == 1)
-			return;
-
-		atomic_set(&charger_atomic_detection, 1);
-
-		fsl_idle_low_power_exit(udc);
-	}
-	else {
-		if (atomic_read(&charger_atomic_detection) == 0)
-			return;
-
-		atomic_set(&charger_atomic_detection, 0);
-
-		if (udc->driver && udc->driver->disconnect)
-			udc->driver->disconnect(&udc->gadget);
-
-		device_remove_file(udc->gadget.dev.parent, &dev_attr_connected);
-
-		kobject_uevent_atomic(&udc->gadget.dev.parent->kobj, KOBJ_REMOVE);
-	}
-
-	if (udc_stopped) {
-		udc_stopped = 0; 
-		mod_timer(&udc->detect_timer, 
-				jiffies + (msecs_to_jiffies(CHARGER_TYPE_SUSPEND)));
-	}
-	else
-		mod_timer(&udc->detect_timer, jiffies + (msecs_to_jiffies(CHARGER_TYPE)));
-}
-
-static void callback_bpon_event(void *param)
-{
-	printk(KERN_DEBUG "callback_bpon_event\n");
-	pmic_enable_bpon_charging();
-}
-
-/*
- *! The charger timer is configured for 120 minutes in APLite.
- *  The charger is automatically turned off after 120 minutes of
- *  charging. Once this occurs, the APLite generates a CHGFAULT
- *  with the sense bits correctly set to "10"
- */
-static void callback_faulti(void *param)
-{
-	int sense_0 = 0;
-	/* Bits 9 and 8 should be "10" to detect charger timer expiry */
-	int charger_timer_mask = 0x200;
-
-	pmic_read_reg(REG_INT_SENSE0, &sense_0, 0xffffff);
-
-	sense_0 &= CHGFAULTM;
-
-	switch(sense_0) /*see mc13892 data sheet*/
-	{	case 0x100:	printk(KERN_INFO "arcotg_udc: I pmic:faulti:sense_0=0x%x:charger path over voltage/dissipation in pass device.\n", sense_0);
-		break;
-		case 0x200: 	printk(KERN_INFO "arcotg_udc: I pmic:faulti:sense_0=0x%x:battery dies/charger times out.\n", sense_0);	
-		break;
-		case 0x300:	printk(KERN_INFO "arcotg_udc: I pmic:faulti:sense_0=0x%x:battery out of temperature.\n", sense_0);
-		break;
-		default:
-				;
-	}
-	/* Restart charging if the charger timer has expired */
-	if (sense_0 & charger_timer_mask) {
-
-	    /*
-	     * According to the IEEE 1725 spec, the max charger timer
-	     * should not exceed 6 hours or 360 minutes
-	     */
-	    if (charger_timer_expiry_counter >= charger_timer_expiry_threshold) {
-
-		pr_debug("%s: charge timer expired!  Do not restart charging\n", __func__);
-		charger_timer_expiry_counter++;
-
-	    } else {
-	    
-		if (charger_connected()) {
-		    pmic_restart_charging();
-		    charger_timer_expiry_counter++;
-		}
-	    }
-	} 
-}
-
-/*
- * CHRGSE1B wall charger detect 
- */
-static void callback_se1b(void *param)
-{
-	int sense_0 = 0;
-
-	pmic_read_reg(REG_PU_MODE_S, &sense_0, 0xffffff);
-
-	/* In the MX508 1.1 silicon, this event significes the presence of a wall charger */
-	if (cpu_is_mx50_rev(CHIP_REV_1_1) >= 1) {
-
-		/* if chgdet has not occurred yet, set the ichrg to 480mA and get started */
-		if (!ichrg_value)
-			pmic_set_chg_current(CHARGING_THIRD_PARTY);
-	}
-}
-
-/*!
- * The battery driver has already computed the voltage. So, do not redo 
- * this calculation as it unnecessary generates PMIC/SPI traffic every
- * 10 seconds. Reuse the value unless battery error flags are set.
- */
-static int read_supply_voltage(void)
-{
-	unsigned short bp = 0;
-
-	// force read the voltage if it is not initialized.	
-	if ((!yoshi_battery_error_flags) && (yoshi_voltage > 0))
-		return yoshi_voltage;
-
-	if (pmic_adc_convert(APPLICATION_SUPPLY, &bp)) {
-		printk(KERN_ERR "arcotg_udc: E pmic:could not read APPLICATION_SUPPLY from adc:\n");
-		return -1;
-	}
-
-	/*
-	 * MC13892: Multiply the adc value by BATT_VOLTAGE_SCALE to get
-	 * the battery value. This is from the Atlas Lite manual
-	 */
-	return bp*BATT_VOLTAGE_SCALE/1000; /* Return in mV */
-}
-
-static int read_chrgraw_voltage(void)
-{
-	unsigned short bp = 0;
-
-	if (pmic_adc_convert(2, &bp)) {
-		printk(KERN_ERR "arcotg_udc: E pmic:could not read CHRGRAW from adc:\n");
-		return -1;
-	}
-
-	return bp;
-}
-
-/*!
- * Read the PMIC A/D for Charger Voltage, i.e. CHGRAW
- */
-static int read_charger_voltage(void)
-{
-	unsigned short bp = 0;
-
-	if (pmic_adc_convert(CHARGE_VOLTAGE, &bp)) {
-		printk(KERN_ERR "arcotg_udc: E pmic:could not read CHARGER_VOLTAGE from adc:\n");
-		return -1;
-	}
-
-	return bp*CHARGE_VOLTAGE_SCALE/1000; /* Return in mV */
-}
-
-/*!
- * Read the PMIC A/D for accurate LOBAT readings
- */
-static int read_lobat_supply_voltage(void)
-{
-	unsigned short bp = 0;
-	int err = 0;
-
-	err = pmic_adc_convert(APPLICATION_SUPPLY, &bp);
-
-	if (err) {
-		printk(KERN_ERR "arcotg_udc: E pmic:could not read APPLICATION_SUPPLY from adc: %d:\n", err);
-		return err;
-	}
-
-	/*
-	 * MC13892: Multiply the adc value by BATT_VOLTAGE_SCALE to get
-	 * the battery value. This is from the Atlas Lite manual
-	 */
-	return bp*BATT_VOLTAGE_SCALE/1000; /* Return in mV */
-}
-
-static void lobat_work(void)
-{
-	int batt_voltage = read_lobat_supply_voltage();
-
-	if (batt_voltage < 0)
-		return;
-
-	if (udc_controller->lobathi == 1) {
-		udc_controller->lobathi = 0;
-
-		if (batt_voltage > LOW_VOLTAGE_THRESHOLD) {
-			if (printk_ratelimit())
-				printk(KERN_ERR "arcotg_udc: I pmic:lobat:lobathi=%d:\n", batt_voltage);
-			goto out;
-		}
-
-		post_lobat_event(0);
-	}
-
-	if (udc_controller->lobatli == 1) {
-		udc_controller->lobatli = 0;
-
-		if (batt_voltage > CRITICAL_VOLTAGE_THRESHOLD) {
-			if (printk_ratelimit())
-				printk(KERN_ERR "arcotg_udc: I pmic:lobat:lobatli=%d:\n", batt_voltage);
-			goto out;
-		}
-
-		post_lobat_event(1);
-	}
-out:
-	return;
-		
-}
-		
-/*
- * LOBATHI event callback from Atlas
- */
-static void callback_lobathi_event(void *param)
-{
-	lobat_work();
-}
-
-/*
- * LOBATLI event callback from Atlas
- */
-static void callback_lobatli_event(void *param)
-{
-	lobat_work();
 }
 	
 /*----------------------------------------------------------------
@@ -4466,7 +3370,6 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 	int ret = -ENODEV;
 	unsigned int i;
 	u32 dccparams;
-	unsigned int reg_memory_a;
 
 	if (strcmp(pdev->name, driver_name)) {
 		VDBG("Wrong device\n");
@@ -4634,83 +3537,16 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 		goto err4;
 	}
 
-	/* The charger detect work timer */
-	init_timer(&udc_controller->detect_timer);
-	udc_controller->detect_timer.data = (unsigned long) udc_controller;
-	udc_controller->detect_timer.function = fsl_charger_type_detect;
-
-	/* bvalid detect timer */
-	init_timer(&udc_controller->bvalid_detect_timer);
-	udc_controller->bvalid_detect_timer.data = (unsigned long) udc_controller;
-	udc_controller->bvalid_detect_timer.function = fsl_bvalid_type_detect;
-
 	/*
 	 * Charger 
 	 */
-	charger_detect.param = (void *)udc_controller;
-	charger_detect.func = callback_charger_detect;
-	CHECK_ERROR(pmic_event_subscribe(EVENT_CHGDETI, charger_detect));
+	charger_event_subscribe(CHARGER_CONNECT_EVENT, &callback_charger_event,
+			udc_controller);
+	charger_event_subscribe(CHARGER_LOBAT_EVENT, &callback_lobat_event,
+			udc_controller);
 
-	bvalid_detect.param = (void *)udc_controller;
-	bvalid_detect.func = callback_bvalid_detect;
-	ret = pmic_event_subscribe(EVENT_BVALIDI, bvalid_detect);
+	charger_conn_probe = is_charger_connected();
 
-	pr_debug("pmic_event_subscribe: %d\n", ret);
-
-	lobatli_event.param = (void *)udc_controller;
-	lobatli_event.func = callback_lobatli_event;	
-	CHECK_ERROR(pmic_event_subscribe(EVENT_LOBATLI, lobatli_event));
-
-	lobathi_event.param = (void *)udc_controller;
-	lobathi_event.func = callback_lobathi_event;
-	CHECK_ERROR(pmic_event_subscribe(EVENT_LOBATHI, lobathi_event));
-
-	bpon_event.param = (void *)udc_controller;
-	bpon_event.func = callback_bpon_event;
-	CHECK_ERROR(pmic_event_subscribe(EVENT_BPONI, bpon_event));
-
-	chgfaulti_event.param = (void *)udc_controller;
-	chgfaulti_event.func = callback_faulti;
-	CHECK_ERROR(pmic_event_subscribe(EVENT_CHGFAULTI, chgfaulti_event));
-
-	chrgse1b_event.param = (void *)udc_controller;
-	chrgse1b_event.func = callback_se1b;
-	CHECK_ERROR(pmic_event_subscribe(EVENT_SE1I, chrgse1b_event));
-
-	/* Set the BPSNS */
-	CHECK_ERROR(pmic_write_reg(PMIC_REG_PC_0, BPSNS_VALUE << BPSNS_OFFSET,
-				BPSNS_MASK << BPSNS_OFFSET));
-
-	/* If bit is already set, then it is a fall through */
-	pmic_read_reg(REG_MEM_A, &reg_memory_a, (0x1f << 0));
-	if (reg_memory_a & 0x10)
-		printk(KERN_ERR "boot: I def:Booting out of critical battery::\n");
-	
-	/* Clear out bit #4 in MEMA */
-	pmic_write_reg(REG_MEM_A, (0 << 4), (1 << 4));
-
-	/* Turn off the green led */
-	pmic_enable_green_led(0);
-	pmic_green_led_disable(1);
-
-	if (charger_connected()) {
-		charger_conn_probe = 1;
-		printk(KERN_INFO "arcotg_udc: I pmic:chargerInit::\n");
-		/*
-		 * The module is just loaded, check capacity. If <= 4%,
-		 * then we are surely in recovery utils
-		 */
-		if (yoshi_battery_capacity <= CHARGER_BOOT_THRESHOLD) {
-			/* Turn on bit #4 */
-			pmic_write_reg(REG_MEM_A, (1 << 4), (1 << 4));
-			crit_boot_flag = 1;
-		}
-
-	}
-	/* yellow LED - Atlas Control */
-	gpio_chrgled_active(1);
-
-	third_party_detect_timer = THIRD_PARTY_DETECT;
 	usb_lpm_timer = CHARGER_TYPE_LPM;
 
 	if (device_create_file(udc_controller->gadget.dev.parent,
@@ -4783,42 +3619,21 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 
 	INIT_WORK(&udc_controller->usbtest_work, usbtest_workqueue_handler);
 
-	schedule_delayed_work(&charger_misc_work, msecs_to_jiffies(CHARGER_MISC));
-
 	fsl_udc_init_debugfs(udc_controller);
 
-	udc_controller->lobatli = 0;
-	udc_controller->lobathi = 0;
+	charging_wall_mA = CHARGING_THIRD_PARTY;
 
-	/* Turn on charger detection on IMX508 */
+	/* magic number from Data Sheets/Freescale/iMX50_508/MX50_Preliminary_Reference_Manual Rev B.pdf
+	 * Page 3039
+	 * for data integrity*/
 
-	/* Turn on CHRGDETON */
-	USBH1_PHY_CTRL0 |= 0x800000;
-
-	/* Wait 300us */
-	udelay(300);
-
-	/* Trun on CHRGDETEN */
-	USBH1_PHY_CTRL0 |= 0x1000000;
-
-	/* Set the charger timer expiry threshold and ichrg */
-	charging_wall_mA = CHARGING_WALL;
-
-	if (mx50_board_is(BOARD_ID_TEQUILA)) {
-	    charger_timer_expiry_threshold = CHRG_TIMER_THRESHOLD_TEQ;
-	}
-
-        /* magic number from Data Sheets/Freescale/iMX50_508/MX50_Preliminary_Reference_Manual Rev B.pdf 
-         * Page 3039
-         * for data integrity*/
-        
-        /*
-         *  -enable high speed driver pre-emphasis
-         *  -reduce PLL charge pump current (Icp) by 50%
-         *  -change PMOS HS driver timing from 2x to 8x
-         *  -increase HS driver amplitude by 2.5% (nominal is 17.78mA)  
-         * */
-        USB_PHY_CTR_FUNC2 = 0x90545601;
+	/*
+	 *  -enable high speed driver pre-emphasis
+	 *  -reduce PLL charge pump current (Icp) by 50%
+	 *  -change PMOS HS driver timing from 2x to 8x
+	 *  -increase HS driver amplitude by 2.5% (nominal is 17.78mA)
+	 * */
+	USB_PHY_CTR_FUNC2 = 0x90545601;
 
 	printk(KERN_INFO "kernel: I perf:usb:usb_gadget_loaded=");
 	mxc_kernel_uptime(); 
@@ -4857,12 +3672,8 @@ static int __exit fsl_udc_remove(struct platform_device *pdev)
 		return -ENODEV;
 
 	udc_suspended_mode = 1;
-	cancel_rearming_delayed_work(&charger_misc_work);
-	del_timer_sync(&udc_controller->detect_timer);
-	del_timer_sync(&udc_controller->bvalid_detect_timer);
 	cancel_rearming_delayed_work(&udc_controller->charger_detect_work);
 	cancel_rearming_delayed_work(&pc_wq);
-	cancel_rearming_delayed_work(&third_party_work);
 	cancel_rearming_delayed_work(&host_enumeration_detect);
 	cancel_rearming_delayed_work(&phy_lpm_worker);
 	cancel_rearming_delayed_work(&phy_resume_work);
@@ -4903,19 +3714,15 @@ static int __exit fsl_udc_remove(struct platform_device *pdev)
 	device_remove_file(udc_controller->gadget.dev.parent, &dev_attr_third_party_timer);
 	device_remove_file(udc_controller->gadget.dev.parent, &dev_attr_usb_lpm_timer_threshold);
 
-	/* Charger */
-	CHECK_ERROR(pmic_event_unsubscribe(EVENT_CHGDETI, charger_detect));
-	CHECK_ERROR(pmic_event_unsubscribe(EVENT_BVALIDI, bvalid_detect));
-	CHECK_ERROR(pmic_event_unsubscribe(EVENT_LOBATLI, lobatli_event));
-	CHECK_ERROR(pmic_event_unsubscribe(EVENT_LOBATHI, lobathi_event));
-	CHECK_ERROR(pmic_event_unsubscribe(EVENT_BPONI, bpon_event));
-	CHECK_ERROR(pmic_event_unsubscribe(EVENT_CHGFAULTI, chgfaulti_event));
-	CHECK_ERROR(pmic_event_unsubscribe(EVENT_SE1I, chrgse1b_event));
+	if (charger_event_unsubscribe(CHARGER_CONNECT_EVENT, &callback_charger_event)) {
+		printk(KERN_ERR "%s: Could not unsubscribe from charger connect event\n", __func__);
+	}
+	if (charger_event_unsubscribe(CHARGER_LOBAT_EVENT, &callback_lobat_event)) {
+		printk(KERN_ERR "%s: Could not unsubscribe from lobat event\n", __func__);
+	}
 
 	clk_put(usb_ahb_clk);
 	clk_put(usb_phy1_clk);
-	udc_controller->lobatli = 0;
-	udc_controller->lobathi = 0;
 
 #ifndef ARC_OTG
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -4950,13 +3757,6 @@ static int udc_suspend(struct fsl_udc *udc)
  -----------------------------------------------------------------*/
 static int fsl_udc_suspend(struct device *dev, pm_message_t state)
 {
-	cancel_rearming_delayed_work(&charger_misc_work);
-	cancel_rearming_delayed_work(&third_party_work);
-	del_timer_sync(&udc_controller->detect_timer);
-	flush_work(&charger_detect_work);
-	del_timer_sync(&udc_controller->bvalid_detect_timer);
-	flush_work(&bvalid_detect_work);
-
 	return udc_suspend(udc_controller);
 }
 
@@ -4979,45 +3779,18 @@ static int fsl_udc_resume(struct device *dev)
 
 static int arcotg_suspend(struct platform_device *pdev, pm_message_t state)
 {
-	int batt_voltage = 0;
-
-	pmic_write_reg(PMIC_REG_PC_0, BPSNS_VALUE_SUSPEND << BPSNS_OFFSET,
-					BPSNS_MASK << BPSNS_OFFSET);
-
-	if (mxc_spi_suspended)
-		batt_voltage = read_supply_voltage();
-	else
-		batt_voltage = read_lobat_supply_voltage();
-
-	if (batt_voltage == -EBUSY && !mxc_spi_suspended) {
-		batt_voltage = read_supply_voltage();
-	}
-
-	if (yoshi_battery_valid() && batt_voltage && (batt_voltage <= CHRG_SUS_LOW_VOLTAGE))
-		return -EBUSY;
-
-	if (yoshi_battery_valid() && batt_voltage && (batt_voltage <= LOW_VOLTAGE_THRESHOLD)) {
-		post_lobat_event(0);
-		return -EBUSY;
-	}
+	/* TODO: Return -EBUSY for low battery conditions */
 
 	udc_suspended_mode = 1;
-	cancel_rearming_delayed_work(&charger_misc_work);
-	cancel_rearming_delayed_work(&third_party_work);
-	del_timer_sync(&udc_controller->detect_timer);
-	flush_work(&charger_detect_work);
-	del_timer_sync(&udc_controller->bvalid_detect_timer);
-	flush_work(&bvalid_detect_work);
 
 	udc_stopped = 1;
-	gpio_chrgled_active(1);
 	return 0;
 }
 
 /*! Phy low power on resumw */
 static void phy_low_power_resume(struct work_struct *work)
 {
-	if (!charger_connected()) {
+	if (!is_charger_connected()) {
 		udc_stopped = 0;
 		pr_debug("arcotg_udc: Putting Phy in low power mode\n");
 	}
@@ -5026,7 +3799,6 @@ static void phy_low_power_resume(struct work_struct *work)
 static int arcotg_resume(struct platform_device *pdev)
 {
 	udc_suspended_mode = 0;
-	schedule_delayed_work(&charger_misc_work, msecs_to_jiffies(CHARGER_MISC));
 	schedule_delayed_work(&phy_resume_work, msecs_to_jiffies(PHY_LPM_TIMER));
 	return 0;
 }

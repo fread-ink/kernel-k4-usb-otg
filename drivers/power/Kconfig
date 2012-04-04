@@ -129,6 +129,12 @@ config BATTERY_YOSHI
         help
           Say Y to enable support for reading the MX5 YOSHI Battery
 
+config CHARGER_YOSHI
+        tristate "MX5 YOSHI Charger Driver"
+        depends on BATTERY_YOSHI
+        help
+          Say Y here to get support for the i.MX5 Yoshi charger.
+
 config BATTERY_BQ27541
 	tristate "BQ27541 Battery Driver"
 	help

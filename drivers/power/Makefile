@@ -31,6 +31,7 @@ obj-$(CONFIG_CHARGER_PCF50633)	+= pcf50633-charger.o
 obj-$(CONFIG_BATTERY_STMP3XXX)	+= stmp37xx/
 obj-$(CONFIG_BATTERY_MXS)	+= mxs/
 obj-$(CONFIG_BATTERY_YOSHI)	+= yoshi_battery.o
+obj-$(CONFIG_CHARGER_YOSHI)	+= yoshi_charger.o
 obj-$(CONFIG_BATTERY_BQ27541)	+= battery_bq27541.o
 obj-$(CONFIG_MAXIM_AL32)	+= maxim_al32.o
 obj-$(CONFIG_SUMMIT_SMB347)	+= summit_smb347.o

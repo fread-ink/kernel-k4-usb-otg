@@ -588,11 +588,6 @@ struct fsl_udc {
 
 	struct work_struct usbtest_work;	/* USB test mode workqueue handler */
 	struct timer_list timer;		/* Main charger timer fn */
-	struct timer_list detect_timer;		/* Detect the charger type */
-	struct timer_list bvalid_detect_timer;
-
-	int lobathi;				/*LOBATH event */
-	int lobatli;				/* LOBATL event */
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;
