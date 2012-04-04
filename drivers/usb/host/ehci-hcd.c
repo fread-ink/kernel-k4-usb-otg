@@ -1013,10 +1013,6 @@ static void ehci_stop (struct usb_hcd *hcd)
 
 	ehci_dbg (ehci, "stop\n");
 
-	/* prevent mwan from waking up USB because module */
-	/* is no longer available to respond to callback  */
-	wan_set_usb_wake_callback(NULL);
-
 	/* no more interrupts ... */
 	del_timer_sync (&ehci->watchdog);
 	del_timer_sync(&ehci->iaa_watchdog);

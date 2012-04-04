@@ -78,7 +78,6 @@ wakeup_enable_store(struct device *dev, struct device_attribute *attr,
 {
 	if (strstr(buf, "1") != NULL) {
 		wakeup_value = 1;
-		wan_set_usb_wake_callback(ehci_hcd_recalc_work);
 		ehci_hcd_restart_idle();
 	}
 	else {
