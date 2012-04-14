@@ -3198,12 +3198,6 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 		printk(KERN_ERR "Looks like a non-charger connected: 0x%x\n", sense_0);
 		return -ENODEV;
 	}
-
-	udc_controller->transceiver = otg_get_transceiver();
-	if (!udc_controller->transceiver) {
-		printk(KERN_ERR "Can't find OTG driver! (try modprobe \"fsl_otg_arc\" first)\n");
-		return -ENODEV;
-	}
 #endif
 
 	udc_controller = kzalloc(sizeof(struct fsl_udc), GFP_KERNEL);
@@ -3212,6 +3206,15 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 	udc_controller->pdata = pdata;
+
+#ifdef CONFIG_USB_EHCI_ARC_OTG
+	udc_controller->transceiver = otg_get_transceiver();
+	if (!udc_controller->transceiver) {
+		printk(KERN_ERR "Can't find OTG driver! (try modprobe \"fsl_otg_arc\" first)\n");
+		kfree(udc_controller);
+		return -ENODEV;
+	}
+#endif
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
