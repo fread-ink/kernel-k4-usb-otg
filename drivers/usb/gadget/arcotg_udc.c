@@ -27,6 +27,7 @@
 #include <linux/init.h>
 #include <linux/timer.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/interrupt.h>
 #include <linux/proc_fs.h>
 #include <linux/mm.h>
@@ -89,6 +90,10 @@ volatile static struct usb_sys_interface *usb_sys_regs;
 /* it is initialized in probe()  */
 static struct fsl_udc *udc_controller;
 
+extern int usbotg_low_power_enter(void);
+extern int usbotg_low_power_exit(void);
+extern void usbotg_uninit_port(struct fsl_usb2_platform_data *pdata);
+
 extern void accessory_charger_disable(void);
 extern void accessory_charger_enable(void);
 extern int gpio_accessory_charger_detected(void);
@@ -125,17 +130,17 @@ static const size_t g_iram_size = IRAM_TD_PPH_SIZE;
 static void resume_ctrl(void);
 static int udc_suspend(struct fsl_udc *udc);
 static void do_charge_current_work(struct work_struct *work);
-static int fsl_udc_suspend(struct device *dev, pm_message_t state);
-static int fsl_udc_resume(struct device *dev);
+static int low_power_enter(struct fsl_udc *udc);
+static int low_power_exit(struct fsl_udc *udc);
+static int fsl_udc_suspend(struct platform_device *dev, pm_message_t state);
+static int fsl_udc_resume(struct platform_device *dev);
 static void fsl_ep_fifo_flush(struct usb_ep *_ep);
+static int fsl_set_current_limit(struct fsl_udc *udc, unsigned int mA);
 static int udc_detection = 0;
 static int udc_stopped = 0;
 
 static int current_limit;
 static int charging_wall_mA = 0;
-
-/* Do not suspend the PHY */
-static int udc_phy_suspend = 0;
 
 /* port change work */
 static void port_change_work(struct work_struct *work);
@@ -145,9 +150,7 @@ static void resume_ctrl(void);
 static void suspend_ctrl(void);
 static void fsl_udc_redo_enumerate(void);
 
-#undef ARC_OTG
-
-#ifdef ARC_OTG
+#ifdef CONFIG_USB_EHCI_ARC_OTG
 /* Get platform resource from OTG driver */
 extern struct resource *otg_get_resources(void);
 #endif
@@ -160,10 +163,6 @@ extern struct resource *otg_get_resources(void);
 #define fsl_writel(addr, val32) writel((addr), (val32))
 #endif
 
-static struct clk *usb_ahb_clk;
-static struct clk *usb_phy1_clk;
-static void fsl_idle_low_power_exit(struct fsl_udc *udc);
-static void fsl_idle_low_power_enter(struct fsl_udc *udc);
 static void fsl_detect_charger_type(void);
 static int not_detected = 0;
 static int host_detected = 0; 		/* Has a host been detected? */
@@ -173,8 +172,6 @@ DECLARE_WORK(charge_current_work, do_charge_current_work);
 static DECLARE_DELAYED_WORK(phy_resume_work, phy_low_power_resume);
 
 static int udc_suspended_mode = 0; /* gadget driver suspended state */
-
-static int usb_lpm_timer = 0;
 
 #define VBUSVALIDS		0x08	/* Sense bit for valid VBUS */
 #define PC_WORK_THRESHOLD	30000	/* Port change threshold */
@@ -186,7 +183,6 @@ static int usb_lpm_timer = 0;
 #define PHY_LPM_TIMER		20000	/* 20 seconds after resume */
 #define THIRD_PARTY_DETECT	30000	/* Third Party charger detect */
 #define HOST_ENU_DETECT 	100	/* Host enumeration check */
-#define IDGND_SENSE		(1 << 20)
 #define CHRG_SUS_LOW_VOLTAGE	3420	/* 3.42V */
 
 #define PMIC_IRQ			108	/* PMIC IRQ */
@@ -247,16 +243,6 @@ static ssize_t
 show_accessory_charger(struct device *dev, struct device_attribute *attr, char *buf);
 static DEVICE_ATTR(accessory_charger, 0444, show_accessory_charger, NULL);
 
-
-
-extern void pmic_vusb2_enable_vote(int enable,int source);
-/* Turn VUSB2 on/off */
-static void pmic_vusb2_enable(int enable)
-{
-#define VUSB2_VOTE_SOURCE_OTG  (1U << 1)
-	pmic_vusb2_enable_vote(enable,VUSB2_VOTE_SOURCE_OTG);
-}
-
 /********************************************************************
  *	Internal Used Function
 ********************************************************************/
@@ -303,7 +289,7 @@ static void wall_charger_start_charging(void)
 {
 	printk(KERN_INFO "arcotg_udc: I pmic:chargerWall\n");
 
-	charger_set_current_limit(charging_wall_mA);
+	fsl_set_current_limit(udc_controller, charging_wall_mA);
 	
 	kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 	if (device_create_file(udc_controller->gadget.dev.parent,
@@ -340,7 +326,6 @@ static void do_charger_detect_work(struct work_struct *work)
 		if (!not_detected) {
 			pr_debug("%s: not detected prb=%d\n", __func__, charger_conn_probe);
 
-			atomic_set(&charger_atomic_detection, 1);
 			if (charger_conn_probe == 1) {
 				charger_conn_probe = 0;
 				if (is_wall_charger_attached()) {
@@ -353,15 +338,13 @@ static void do_charger_detect_work(struct work_struct *work)
 			}
 		}
 	} else {
-		pr_debug("No USB/Charger found ... entering low power idle\n");
-		fsl_idle_low_power_enter(udc);
+		printk(KERN_INFO "No USB/Charger found.\n");
 	}
 }
 
 /*!
  * Post a low battery or a critical battery event to the userspace 
  */
-/* TODO: Ensure that this is actually called */
 static void callback_lobat_event(void *param)
 {
 	if (!charger_have_low_battery())
@@ -616,26 +599,11 @@ static void dr_controller_stop(struct fsl_udc *udc)
 {
 	unsigned int tmp;
 
-	pr_debug("%s\n", __func__);
-
-	/* if we're in OTG mode, and the Host is currently using the port,
-	 * stop now and don't rip the controller out from under the
-	 * ehci driver
-	 */
-	if (udc->gadget.is_otg) {
-		if (!(fsl_readl(&dr_regs->otgsc) & OTGSC_STS_USB_ID)) {
-			pr_debug("udc: Leaving early\n");
-			return;
-		}
-	}
+	DBG("%s\n", __func__);
 
 	last_free_td = NULL;
 
-	/* disable all INTR */
-	fsl_writel(0, &dr_regs->usbintr);
-
-	/* Set stopped bit for isr */
-	udc->stopped = 1;
+	udc_suspend(udc);
 
 	/* disable IO output */
 /*	usb_sys_regs->control = 0; */
@@ -1496,7 +1464,7 @@ static int fsl_vbus_session(struct usb_gadget *gadget, int is_active)
 }
 
 static void do_charge_current_work(struct work_struct *work) {
-	charger_set_current_limit(current_limit);
+	fsl_set_current_limit(udc_controller, current_limit);
 }
 
 /* constrain controller's VBUS power usage
@@ -2359,7 +2327,6 @@ int usb_gadget_register_driver(struct usb_gadget_driver *driver)
 	if (udc_controller->driver)
 		return -EBUSY;
 
-	fsl_idle_low_power_exit(udc_controller);
 	/* lock is needed but whether should use this lock or another */
 	spin_lock_irqsave(&udc_controller->lock, flags);
 
@@ -2379,25 +2346,15 @@ int usb_gadget_register_driver(struct usb_gadget_driver *driver)
 	}
 
 	if (udc_controller->transceiver) {
-		/* Suspend the controller until OTG enable it */
-		udc_suspend(udc_controller);
-		pr_debug("Suspend udc for OTG auto detect\n");
-
-		/* export udc suspend/resume call to OTG */
-		udc_controller->gadget.dev.driver->suspend = fsl_udc_suspend;
-		udc_controller->gadget.dev.driver->resume = fsl_udc_resume;
-
 		/* connect to bus through transceiver */
-		if (udc_controller->transceiver) {
-			retval = otg_set_peripheral(udc_controller->transceiver,
-						    &udc_controller->gadget);
-			if (retval < 0) {
-				ERR("can't bind to transceiver\n");
-				driver->unbind(&udc_controller->gadget);
-				udc_controller->gadget.dev.driver = 0;
-				udc_controller->driver = 0;
-				return retval;
-			}
+		retval = otg_set_peripheral(udc_controller->transceiver,
+				&udc_controller->gadget);
+		if (retval < 0) {
+			ERR("can't bind to transceiver\n");
+			driver->unbind(&udc_controller->gadget);
+			udc_controller->gadget.dev.driver = 0;
+			udc_controller->driver = 0;
+			return retval;
 		}
 	} else {
 		/* Enable DR IRQ reg and Set usbcmd reg  Run bit */
@@ -2421,6 +2378,7 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 {
 	struct fsl_ep *loop_ep;
 	unsigned long flags;
+	int ret;
 
 	if (!udc_controller)
 		return -ENODEV;
@@ -2428,13 +2386,22 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 	if (!driver || driver != udc_controller->driver || !driver->unbind)
 		return -EINVAL;
 
-	fsl_idle_low_power_exit(udc_controller);
+	if (udc_controller->transceiver) {
+		/* We still need the port to be active for flushing the endpoints
+		 * later so we need to avoid that the OTG's call to fsl_udc_suspend
+		 * leads to a dead OTG port.
+		 * So we have to grab an additional ref to the port here and release
+		 * it later when all the endpoints have been flushed.
+		 */
+		if ((ret = usbotg_low_power_exit())) {
+			return ret;
+		}
 
-	if (udc_controller->transceiver)
 		(void)otg_set_peripheral(udc_controller->transceiver, 0);
-
-	/* stop DR, disable intr */
-	dr_controller_stop(udc_controller);
+	} else {
+		/* stop DR, disable intr */
+		dr_controller_stop(udc_controller);
+	}
 
 	/* in fact, no needed */
 	udc_controller->usb_state = USB_STATE_ATTACHED;
@@ -2450,7 +2417,14 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 		nuke(loop_ep, -ESHUTDOWN);
 	spin_unlock_irqrestore(&udc_controller->lock, flags);
 
-	/* disconnect gadget before unbinding */
+	if (udc_controller->transceiver) {
+		/* release the port handle for the EP flush work */
+		if ((ret = usbotg_low_power_enter())) {
+			printk(KERN_ERR "%s: ERROR: Could not enter low power mode. Error=%d. Not fatal.",
+					__func__, ret);
+		}
+	}
+
 	if (driver->disconnect)
 		driver->disconnect(&udc_controller->gadget);
 
@@ -2805,35 +2779,6 @@ static int __init struct_udc_setup(struct fsl_udc *udc,
 	return 0;
 }
 
-static void suspend_port(void)
-{
-	unsigned int portctrl = 0;
-
-	portctrl = fsl_readl(&dr_regs->portsc1);
-        portctrl |= PORTSCX_PHY_LOW_POWER_SPD;
-	fsl_writel(portctrl, &dr_regs->portsc1);
-}
-
-static void resume_port(void)
-{
-	unsigned int portctrl = 0;
-
-	if (portctrl & PORTSCX_PORT_SUSPEND) {
-		portctrl = fsl_readl(&dr_regs->portsc1);
-		portctrl |= PORTSCX_PORT_FORCE_RESUME;
-		fsl_writel(portctrl, &dr_regs->portsc1);
-	}
-
-	portctrl = fsl_readl(&dr_regs->portsc1);
-	portctrl &= ~PORTSCX_PHY_LOW_POWER_SPD;
-	fsl_writel(portctrl, &dr_regs->portsc1);
-
-	while ((portctrl & PORTSCX_PORT_SUSPEND)) {
-		udelay(100);
-		portctrl = fsl_readl(&dr_regs->portsc1);
-	}
-}
-
 static void suspend_ctrl(void)
 {
 	unsigned int usbcmd;
@@ -3000,7 +2945,7 @@ static DEVICE_ATTR (third_party_timer, S_IRUGO|S_IWUSR, show_third_party_timer, 
 static ssize_t
 show_usb_lpm_timer_threshold(struct device *_dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", usb_lpm_timer);
+	return -ENOSYS;
 }
 
 static ssize_t
@@ -3010,8 +2955,7 @@ store_usb_lpm_timer_threshold(struct device *_dev, struct device_attribute *attr
 	int value;
 
 	if ( (sscanf(buf, "%d", &value) > 0) ) {
-		usb_lpm_timer = value;
-		return strlen(buf);
+		return -ENOSYS;
 	}
 
 	return -EINVAL;
@@ -3088,10 +3032,11 @@ static DECLARE_DELAYED_WORK(host_enumeration_detect, host_enumeration_detect_fn)
 static void fsl_detect_charger_type(void)
 {
 	unsigned int portsc1;
+	DBG("%s: enter\n", __func__);
 
 	if (charger_conn_probe) {
 
-		pr_debug("%s: charger conn\n", __func__);
+		DBG("%s: charger conn\n", __func__);
 
 		resume_ctrl();
 		mdelay(10);
@@ -3103,10 +3048,10 @@ static void fsl_detect_charger_type(void)
 	}
 
 	portsc1 = fsl_readl(&dr_regs->portsc1);
-	pr_debug("%s: prtsc1=0x%x\n", __func__, portsc1);
+	DBG("%s: prtsc1=0x%x", __func__, portsc1);
 
 	if ((portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_UNDEF) {
-	    	pr_debug("%s: line undef prtsc1=0x%x\n", __func__, portsc1);
+		DBG("%s: line undef prtsc1=0x%x", __func__, portsc1);
 
 		wall_charger_start_charging();
 		goto out;
@@ -3114,8 +3059,8 @@ static void fsl_detect_charger_type(void)
 
 	if ((portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_KSTATE ||
 	    (portsc1 & PORTSCX_LINE_STATUS_BITS) == PORTSCX_LINE_STATUS_JSTATE) {
-		pr_debug("Connected to a charger: 0x%x\n", portsc1);
-		charger_set_current_limit(CHARGING_HOST);
+		DBG("Connected to a charger: 0x%x", portsc1);
+		fsl_set_current_limit(udc_controller, CHARGING_HOST);
 		
 		kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 		if (device_create_file(udc_controller->gadget.dev.parent,
@@ -3137,7 +3082,7 @@ static void fsl_detect_charger_type(void)
 		}
 
 		if (!atomic_read(&enumerated))
-			charger_set_current_limit(CHARGING_HOST);
+			fsl_set_current_limit(udc_controller, CHARGING_HOST);
 
 		kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 		if (device_create_file(udc_controller->gadget.dev.parent,
@@ -3150,8 +3095,8 @@ static void fsl_detect_charger_type(void)
 
 	if (host_detected) {
 		/* A host as already been detected */
-		pr_debug("Connected to a Host: %d\n", host_detected);
-		charger_set_current_limit(CHARGING_HOST);
+		DBG("Connected to a Host: %d", host_detected);
+		fsl_set_current_limit(udc_controller, CHARGING_HOST);
 
 		kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 		if (device_create_file(udc_controller->gadget.dev.parent,
@@ -3161,7 +3106,7 @@ static void fsl_detect_charger_type(void)
 		goto out;
 	} else {
 		pr_debug("Connected to a third-party charger: 0x%x\n", portsc1);
-		charger_set_current_limit(CHARGING_THIRD_PARTY);
+		fsl_set_current_limit(udc_controller, CHARGING_THIRD_PARTY);
 		kobject_uevent(&udc_controller->gadget.dev.parent->kobj, KOBJ_ADD);
 		if (device_create_file(udc_controller->gadget.dev.parent,
 				&dev_attr_connected) < 0)
@@ -3178,152 +3123,19 @@ out:
 	pr_debug("%s: cmpl\n", __func__);
 }
 
-static void phy_lpm_work(struct work_struct *unused)
-{
-    pr_debug("%s: begin\n", __func__);
-
-    if (!is_charger_connected()) {
-    	fsl_idle_low_power_enter(udc_controller);
-    }
-}
-DECLARE_DELAYED_WORK(phy_lpm_worker, phy_lpm_work);
-
-static void callback_charger_event(void *param)
-{
-	struct fsl_udc *udc = (struct fsl_udc *) param;
-	int chg_state = is_charger_connected();
-
-	if (chg_state) {
-		/* charger already detected? */
-		if (atomic_read(&charger_atomic_detection) == 1)
-			return;
-
-		atomic_set(&charger_atomic_detection, 1);
-
-		fsl_idle_low_power_exit(udc);
-
-		fsl_detect_charger_type();
+static int fsl_set_current_limit(struct fsl_udc *udc, unsigned int mA) {
+	/*
+	 * Set VBus charge current limit. If OTG transceiver is not in use, pass
+	 * the current limit directly to the Yoshi battery. Else we have to set the
+	 * current limit indirectly via the otg transceiver.
+	 */
+	if (udc->transceiver) {
+		return otg_set_power(udc->transceiver, mA);
 	} else {
-		if (atomic_read(&charger_atomic_detection) == 0)
-			return;
-
-		atomic_set(&charger_atomic_detection, 0);
-
-		host_detected = 0;
-		pr_debug("%s: disconnect\n", __func__);
-		
-		if (udc->driver && udc->driver->disconnect)
-			udc->driver->disconnect(&udc->gadget);
-
-		device_remove_file(udc->gadget.dev.parent, &dev_attr_connected);
-		kobject_uevent_atomic(&udc->gadget.dev.parent->kobj, KOBJ_REMOVE);
-
-		/* Clear out the variables */
-		atomic_set(&enumerated, 0);
-		charger_conn_probe = 0;
-		charger_enumerated = 0;
-
-		/* Now, schedule a delayed workqueue to put PHY into LPM */
-		schedule_delayed_work(&phy_lpm_worker,
-				msecs_to_jiffies(usb_lpm_timer));
+		return charger_set_current_limit(mA);
 	}
 }
 
-extern void mx50_anadig_clr(void);
-
-static void fsl_idle_low_power_exit(struct fsl_udc *udc)
-{
-	if (!udc->suspended)
-		return;
-
-	if (udc_phy_suspend)
-		return;
-
-	pmic_vusb2_enable(1);
-
-	mx50_anadig_clr();
-
-	/* First enable the clock */
-	clk_enable(usb_ahb_clk);
-	clk_enable(usb_phy1_clk);
-	udelay(1000); /* Propagation time after clock enable */
-
-	USB_PHY_CTR_FUNC &= ~(1 <<11) ;
-	USB_PHY_CTR_FUNC |= (1 << 12);
-
-	/* Next the port */
-	resume_port();
-
-	/* Enable DR irq reg and set controller Run */
-	if (udc_controller->stopped) {
-		dr_controller_setup(udc_controller);
-		dr_controller_run(udc_controller);
-
-		udc_controller->stopped = 0;
-		udc_controller->usb_state = USB_STATE_ATTACHED;
-		udc_controller->ep0_state = WAIT_FOR_SETUP;
-		udc_controller->ep0_dir = 0;
-	}
-
-	resume_ctrl();
-
-	mx50_anadig_clr();
-
-	udc->suspended = 0;
-	enable_irq(ARCOTG_IRQ);
-	bus_resume(udc);
-
-	/* Disable accessory charging */
-	accessory_charger_disable();
-}
-
-static void fsl_idle_low_power_enter(struct fsl_udc *udc)
-{
-	if (udc->suspended)
-		return;
-
-	if (udc_phy_suspend)
-		return;
-
-	pr_debug("%s: begin\n", __func__);
-
-	disable_irq(ARCOTG_IRQ);
-	udc->suspended = 1;
-	fsl_writel(0, &dr_regs->usbintr);
-
-	/* Suspend PORT first */
-	suspend_port();
-
-	/* Settling time */
-	mdelay(20);
-
-	/* Suspend Controller next */
-	suspend_ctrl();
-
-	/* Settling time */
-	mdelay(20);
-
-	/* Tell upper stack that PHY suspended */
-	suspend_irq(udc);
-
-	USB_PHY_CTR_FUNC &= ~(1 << 12);
-        USB_PHY_CTR_FUNC |= (1 <<11) ;
-
-	clk_disable(usb_ahb_clk);
-	clk_disable(usb_phy1_clk);
-	udc_detection = 0;
-	udc->stopped = 1;
-
-	pmic_vusb2_enable(0);
-
-	mx50_anadig_clr();
-
-	if (!is_charger_connected()) {
-		/* Enable accessory charging */
-		accessory_charger_enable();
-	}
-}
-	
 /*----------------------------------------------------------------
  * Setup the fsl_ep struct for eps
  * Link fsl_ep->ep to gadget->ep_list
@@ -3370,17 +3182,26 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 	int ret = -ENODEV;
 	unsigned int i;
 	u32 dccparams;
+#ifdef CONFIG_USB_EHCI_ARC_OTG
+	unsigned int sense_0;
+#endif
 
 	if (strcmp(pdev->name, driver_name)) {
 		VDBG("Wrong device\n");
 		return -ENODEV;
 	}
 
-#ifdef ARC_OTG
+#ifdef CONFIG_USB_EHCI_ARC_OTG
 	pmic_read_reg(REG_INT_SENSE0, &sense_0, 0xffffff);
 
-	if (!(sense_0 & IDGND_SENSE)) {
+	if (!(sense_0 & (1 << SENSE_IDFLOATS))) {
 		printk(KERN_ERR "Looks like a non-charger connected: 0x%x\n", sense_0);
+		return -ENODEV;
+	}
+
+	udc_controller->transceiver = otg_get_transceiver();
+	if (!udc_controller->transceiver) {
+		printk(KERN_ERR "Can't find OTG driver! (try modprobe \"fsl_otg_arc\" first)\n");
 		return -ENODEV;
 	}
 #endif
@@ -3392,32 +3213,21 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 	}
 	udc_controller->pdata = pdata;
 
-#ifdef ARC_OTG
-	/* Memory and interrupt resources will be passed from OTG */
-	udc_controller->transceiver = otg_get_transceiver();
-	if (!udc_controller->transceiver) {
-		printk(KERN_ERR "Can't find OTG driver!\n");
-	}
-
-	res = otg_get_resources();
-	if (!res) {
-		DBG("resource not registered!\n");
-		return -ENODEV;
-	}
-#else
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
 		ret = -ENXIO;
 		goto err1a;
 	}
 
-	if (!request_mem_region(res->start, resource_size(res),
+	if (!udc_controller->transceiver) {
+		if (!request_mem_region(res->start, resource_size(res),
 				driver_name)) {
-		ERR("request mem region for %s failed \n", pdev->name);
-		ret = -EBUSY;
-		goto err1a;
+			ERR("request mem region for %s failed \n", pdev->name);
+			ret = -EBUSY;
+			goto err1a;
+		}
 	}
-#endif
+
 	dr_regs = ioremap(res->start, resource_size(res));
 	if (!dr_regs) {
 		ret = -ENOMEM;
@@ -3447,18 +3257,15 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 	/* DEN is bidirectional ep number, max_ep doubles the number */
 	udc_controller->max_ep = (dccparams & DCCPARAMS_DEN_MASK) * 2;
 
-#ifdef ARC_OTG
-	res++;
-	udc_controller->irq = res->start;
-#else
 	udc_controller->irq = platform_get_irq(pdev, 0);
-#endif
+	printk(KERN_INFO "IRQ is %u\n", udc_controller->irq);
+
 	if (!udc_controller->irq) {
 		ret = -ENODEV;
 		goto err2;
 	}
 
-	ret = request_irq(udc_controller->irq, fsl_udc_irq, IRQF_DISABLED,
+	ret = request_irq(udc_controller->irq, fsl_udc_irq, IRQF_DISABLED | IRQF_SHARED,
 			driver_name, udc_controller);
 	if (ret != 0) {
 		ERR("cannot request irq %d err %d \n",
@@ -3473,17 +3280,23 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 		goto err3;
 	}
 
+	INIT_DELAYED_WORK(&udc_controller->charger_detect_work, do_charger_detect_work);
+
+	charger_conn_probe = is_charger_connected();
+	charging_wall_mA = CHARGING_THIRD_PARTY;
+
 	if (!udc_controller->transceiver) {
 		/* initialize usb hw reg except for regs for EP,
 		 * leave usbintr reg untouched */
+		printk(KERN_INFO "No transceiver.\n");
 		dr_controller_setup(udc_controller);
-	}
 
-	INIT_DELAYED_WORK(&udc_controller->charger_detect_work, do_charger_detect_work);
-	schedule_delayed_work(&udc_controller->charger_detect_work,
-				msecs_to_jiffies(CHARGER_STARTUP));
-	usb_ahb_clk = clk_get(NULL, "usb_ahb_clk");
-	usb_phy1_clk = clk_get(NULL, "usb_phy1_clk");
+		/* Only do charger detection if there is no OTG transceiver.
+		 * If there is, it might be that the host is currently using the port.
+		 */
+		schedule_delayed_work(&udc_controller->charger_detect_work,
+						msecs_to_jiffies(CHARGER_STARTUP));
+	}
 
 	/* Setup gadget structure */
 	udc_controller->gadget.ops = &fsl_gadget_ops;
@@ -3537,17 +3350,18 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 		goto err4;
 	}
 
-	/*
-	 * Charger 
-	 */
-	charger_event_subscribe(CHARGER_CONNECT_EVENT, &callback_charger_event,
-			udc_controller);
+	mutex_init(&udc_controller->suspend_lock);
+
+	if (udc_controller->transceiver) {
+		/* suspend the PHY until the gadget driver is loaded */
+		if ((ret = low_power_enter(udc_controller))) {
+			printk(KERN_ERR "%s: ERROR Could not enter low power idle. Exiting.\n", __func__);
+			goto err4;
+		}
+	}
+
 	charger_event_subscribe(CHARGER_LOBAT_EVENT, &callback_lobat_event,
-			udc_controller);
-
-	charger_conn_probe = is_charger_connected();
-
-	usb_lpm_timer = CHARGER_TYPE_LPM;
+				udc_controller);
 
 	if (device_create_file(udc_controller->gadget.dev.parent,
 				&dev_attr_charging) < 0)
@@ -3621,20 +3435,6 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 
 	fsl_udc_init_debugfs(udc_controller);
 
-	charging_wall_mA = CHARGING_THIRD_PARTY;
-
-	/* magic number from Data Sheets/Freescale/iMX50_508/MX50_Preliminary_Reference_Manual Rev B.pdf
-	 * Page 3039
-	 * for data integrity*/
-
-	/*
-	 *  -enable high speed driver pre-emphasis
-	 *  -reduce PLL charge pump current (Icp) by 50%
-	 *  -change PMOS HS driver timing from 2x to 8x
-	 *  -increase HS driver amplitude by 2.5% (nominal is 17.78mA)
-	 * */
-	USB_PHY_CTR_FUNC2 = 0x90545601;
-
 	printk(KERN_INFO "kernel: I perf:usb:usb_gadget_loaded=");
 	mxc_kernel_uptime(); 
 
@@ -3675,7 +3475,6 @@ static int __exit fsl_udc_remove(struct platform_device *pdev)
 	cancel_rearming_delayed_work(&udc_controller->charger_detect_work);
 	cancel_rearming_delayed_work(&pc_wq);
 	cancel_rearming_delayed_work(&host_enumeration_detect);
-	cancel_rearming_delayed_work(&phy_lpm_worker);
 	cancel_rearming_delayed_work(&phy_resume_work);
 
 	udc_controller->done = &done;
@@ -3714,20 +3513,14 @@ static int __exit fsl_udc_remove(struct platform_device *pdev)
 	device_remove_file(udc_controller->gadget.dev.parent, &dev_attr_third_party_timer);
 	device_remove_file(udc_controller->gadget.dev.parent, &dev_attr_usb_lpm_timer_threshold);
 
-	if (charger_event_unsubscribe(CHARGER_CONNECT_EVENT, &callback_charger_event)) {
-		printk(KERN_ERR "%s: Could not unsubscribe from charger connect event\n", __func__);
-	}
 	if (charger_event_unsubscribe(CHARGER_LOBAT_EVENT, &callback_lobat_event)) {
 		printk(KERN_ERR "%s: Could not unsubscribe from lobat event\n", __func__);
 	}
 
-	clk_put(usb_ahb_clk);
-	clk_put(usb_phy1_clk);
-
-#ifndef ARC_OTG
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	release_mem_region(res->start, resource_size(res));
-#endif
+	if (!udc_controller->transceiver) {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		release_mem_region(res->start, resource_size(res));
+	}
 
 	device_unregister(&udc_controller->gadget.dev);
 	/* free udc --wait for the release() finished */
@@ -3739,8 +3532,8 @@ static int __exit fsl_udc_remove(struct platform_device *pdev)
 	 * do platform specific un-initialization:
 	 * release iomux pins, etc.
 	 */
-	if (pdata->platform_uninit)
-		pdata->platform_uninit(pdata);
+	low_power_enter(udc_controller);
+	usbotg_uninit_port(pdata);
 
 	return 0;
 }
@@ -3751,30 +3544,107 @@ static int udc_suspend(struct fsl_udc *udc)
 	return 0;
 }
 
+
+static int low_power_enter(struct fsl_udc *udc)
+{
+	int ret;
+
+	mutex_lock(&udc->suspend_lock);
+
+	if (udc->lpm) {
+		mutex_unlock(&udc->suspend_lock);
+
+		return 0;
+	}
+
+	printk(KERN_INFO "%s: Going into low power idle\n", __func__);
+
+	dr_controller_stop(udc);
+
+	host_detected = 0;
+
+	if (udc->driver && udc->driver->disconnect)
+		udc->driver->disconnect(&udc->gadget);
+
+	device_remove_file(udc->gadget.dev.parent, &dev_attr_connected);
+	kobject_uevent_atomic(&udc->gadget.dev.parent->kobj, KOBJ_REMOVE);
+
+	/* Clear out the variables */
+	atomic_set(&enumerated, 0);
+	charger_conn_probe = 0;
+	charger_enumerated = 0;
+
+	if ((ret = usbotg_low_power_enter())) {
+		printk(KERN_ERR "%s: ERROR failed during usbotg_low_power_enter(). retval=%d\n",
+				__func__, ret);
+
+		return ret;
+	}
+
+	udc->lpm = 1;
+	mutex_unlock(&udc->suspend_lock);
+
+	return 0;
+}
+
+static int low_power_exit(struct fsl_udc *udc)
+{
+	int ret;
+
+	mutex_lock(&udc->suspend_lock);
+
+	if (!udc->lpm) {
+		mutex_unlock(&udc->suspend_lock);
+
+		return 0;
+	}
+
+	printk(KERN_INFO "%s: Resuming PHY\n", __func__);
+
+
+	charger_conn_probe = 0;
+	not_detected = 0;
+
+	ret = usbotg_low_power_exit();
+	if (ret) {
+		printk(KERN_INFO "%s: Could not exit low power idle, retval=%d\n", __func__, ret);
+		return ret;
+	}
+
+	/* Enable DR irq reg and set controller Run */
+	dr_controller_setup(udc);
+	dr_controller_run(udc);
+
+	udc->usb_state = USB_STATE_ATTACHED;
+	udc->ep0_state = WAIT_FOR_SETUP;
+	udc->ep0_dir = 0;
+
+	udc->lpm = 0;
+	mutex_unlock(&udc->suspend_lock);
+
+	if (is_charger_connected()) {
+		fsl_detect_charger_type();
+	}
+
+	return 0;
+}
+
 /*-----------------------------------------------------------------
  * Modify Power management attributes
  * Used by OTG statemachine to disable gadget temporarily
  -----------------------------------------------------------------*/
-static int fsl_udc_suspend(struct device *dev, pm_message_t state)
+static int fsl_udc_suspend(struct platform_device *dev, pm_message_t state)
 {
-	return udc_suspend(udc_controller);
+	return low_power_enter(udc_controller);
 }
 
 /*-----------------------------------------------------------------
  * Invoked on USB resume. May be called in_interrupt.
  * Here we start the DR controller and enable the irq
  *-----------------------------------------------------------------*/
-static int fsl_udc_resume(struct device *dev)
+static int fsl_udc_resume(struct platform_device *dev)
 {
-	/* Enable DR irq reg and set controller Run */
-	if (udc_controller->stopped) {
-		dr_controller_setup(udc_controller);
-		dr_controller_run(udc_controller);
-	}
-	udc_controller->usb_state = USB_STATE_ATTACHED;
-	udc_controller->ep0_state = WAIT_FOR_SETUP;
-	udc_controller->ep0_dir = 0;
-	return 0;
+	return low_power_exit(udc_controller);
 }
 
 static int arcotg_suspend(struct platform_device *pdev, pm_message_t state)
@@ -3810,8 +3680,8 @@ static int arcotg_resume(struct platform_device *pdev)
 static struct platform_driver udc_driver = {
 	.remove  = __exit_p(fsl_udc_remove),
 	/* these suspend and resume are not usb suspend and resume */
-	.suspend = arcotg_suspend,
-	.resume  = arcotg_resume,
+	.suspend = fsl_udc_suspend,
+	.resume  = fsl_udc_resume,
 	.probe = fsl_udc_probe,
 	.driver  = {
 		.name = driver_name,

@@ -736,7 +736,7 @@ static void charger_statemachine(void) {
 	mutex_unlock(&chg_state_mutex);
 }
 
-enum charger_status is_charger_connected(void) {
+int is_charger_connected(void) {
 	return chg_connected;
 }
 EXPORT_SYMBOL(is_charger_connected);

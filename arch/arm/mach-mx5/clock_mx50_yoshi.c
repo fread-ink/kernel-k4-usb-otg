@@ -72,6 +72,8 @@ extern int lp_high_freq;
 extern int lp_med_freq;
 void __iomem *databahn;
 
+void mx50_anadig_clr(void);
+
 #define DDR_SYNC_MODE		0x30000
 #define SPIN_DELAY	1000000 /* in nanoseconds */
 
@@ -3672,7 +3674,7 @@ int __init mx50_clocks_init(unsigned long ckil, unsigned long osc, unsigned long
 	mxc_timer_init(&gpt_clk[0], base, MXC_INT_GPT);
 	
 	/* Turn off CHGR_DET */
-	__raw_writel(0x00010000, apll_base + MXC_ANADIG_MISC_SET);
+	mx50_anadig_clr();
 
 	/* Disable rtc and wdog clock */
 	return 0;
@@ -3687,6 +3689,7 @@ void mx50_audio_clock_enable(int enable)
 }
 EXPORT_SYMBOL(mx50_audio_clock_enable);
 
+/* turn on/off charger detect interrupt(CHGR_DET) */
 void mx50_anadig_clr(void)
 {
 	__raw_writel(0x00010000, apll_base + MXC_ANADIG_MISC_SET);

@@ -104,8 +104,11 @@ struct fsl_usb2_platform_data {
 	unsigned ahb_burst_mode:3;
 	unsigned			suspended : 1;
 	unsigned			already_suspended : 1;
+	unsigned            is_active : 1;
 
+	struct mutex    suspend_lock;
 
+	int             irq;
 	u32				id_gpio;
 	/* register save area for suspend/resume */
 	u32				pm_command;

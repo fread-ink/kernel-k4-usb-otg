@@ -740,6 +740,14 @@ static void otg_set_utmi_xcvr(void)
 		/* adjust the Squelch level */
 		USB_PHY_CTR_FUNC2 &= ~(USB_UTMI_PHYCTRL2_HSDEVSEL_MASK <<
 			USB_UTMI_PHYCTRL2_HSDEVSEL_SHIFT);
+	} else if (machine_is_mx50_yoshi()) {
+		/*
+		 *  -enable high speed driver pre-emphasis
+		 *  -reduce PLL charge pump current (Icp) by 50%
+		 *  -change PMOS HS driver timing from 2x to 8x
+		 *  -increase HS driver amplitude by 2.5% (nominal is 17.78mA)
+		 */
+		USB_PHY_CTR_FUNC2 = 0x90545601;
 	}
 
 	/* Workaround an IC issue for ehci driver:
@@ -782,12 +790,150 @@ static void otg_set_utmi_xcvr(void)
 	clk_disable(usb_clk);
 }
 
-static int otg_used = 0;
+#define VUSB2_VOTE_SOURCE_OTG  (1U << 1)
+
+static int otg_init_cnt = 0;
+static int otg_use_cnt = 0;
+
+extern void mx50_anadig_clr(void);
+extern void pmic_vusb2_enable_vote(int enable,int source);
+
+int usbotg_low_power_enter(void)
+{
+	struct clk *usb_phy1_clk;
+
+	printk(KERN_INFO "%s: begin. otg_use_cnt=%d\n", __func__, otg_use_cnt);
+
+	if (otg_use_cnt == 0) {
+		printk(KERN_ERR "%s: Unbalanced disable for USB OTG port\n", __func__);
+		return -ESRCH;
+	}
+	otg_use_cnt--;
+	if (otg_use_cnt != 0)
+		return 0;
+
+	// TODO: Can we keep the IRQ active while in suspend mode?
+	disable_irq(37);
+
+	UOG_USBINTR = 0;
+
+	/* Suspend PORT first */
+	UOG_PORTSC1 |= PORTSC_PHCD;
+
+	/* Settling time */
+	mdelay(20);
+
+	/* Suspend Controller next */
+	UOG_USBCMD &= ~UCMD_RUN_STOP;
+
+	/* Settling time */
+	mdelay(20);
+
+	/*
+	 * Ugh.. According to i.mx50 processor reference, these bits should only be
+	 * used for testing. No idea why lab126 uses them anyhow. Possible it's
+	 * because of the accessory charging code below.
+	 */
+	USB_PHY_CTR_FUNC &= ~USB_UTMI_PHYCTRL_SUSPENDM;
+	USB_PHY_CTR_FUNC |= USB_UTMI_PHYCTRL_RESET;
+
+	clk_disable(usb_ahb_clk);
+	usb_phy1_clk = clk_get(NULL, "usb_phy1_clk");
+	clk_disable(usb_phy1_clk);
+	clk_put(usb_phy1_clk);
+
+	pmic_vusb2_enable_vote(0, VUSB2_VOTE_SOURCE_OTG);
+
+	mx50_anadig_clr();
+
+	//if (!charger_connected()) {
+		/* Enable accessory charging */
+	//	accessory_charger_enable();
+	//}
+	return 0;
+}
+
+EXPORT_SYMBOL(usbotg_low_power_enter);
+
+int usbotg_low_power_exit(void)
+{
+	struct clk *usb_phy1_clk;
+
+	printk(KERN_INFO "%s: begin. otg_use_cnt=%d\n", __func__, otg_use_cnt);
+
+	if (otg_use_cnt++)
+		return 0;
+
+	pmic_vusb2_enable_vote(1, VUSB2_VOTE_SOURCE_OTG);
+
+	mx50_anadig_clr();
+
+	/* First enable the clock */
+	clk_enable(usb_ahb_clk);
+	usb_phy1_clk = clk_get(NULL, "usb_phy1_clk");
+	clk_enable(usb_phy1_clk);
+	clk_put(usb_phy1_clk);
+	udelay(1000); /* Propagation time after clock enable */
+
+	/*
+	 * Ugh.. This seems to be some kind of workaround beyond the specs.
+	 * According to i.mx50 processor reference manual, these bits should be
+	 * used only for testing.
+	 */
+	USB_PHY_CTR_FUNC &= ~USB_UTMI_PHYCTRL_RESET;
+	USB_PHY_CTR_FUNC |= USB_UTMI_PHYCTRL_SUSPENDM;
+
+	/* Next the port */
+	UOG_PORTSC1 &= ~PORTSC_PHCD;
+
+	while ((UOG_PORTSC1 & PORTSC_PORT_SUSPEND)) {
+		udelay(100);
+	}
+
+	/* Workaround an IC issue for ehci driver:
+	 * when turn off root hub port power, EHCI set
+	 * PORTSC reserved bits to be 0, but PTW with 0
+	 * means 8 bits tranceiver width, here change
+	 * it back to be 16 bits and do PHY diable and
+	 * then enable.
+	 */
+	UOG_PORTSC1 |= PORTSC_PTW;
+
+	/* need to reset the controller here so that the ID pin
+	 * is correctly detected.
+	 */
+	/* Stop then Reset */
+	UOG_USBCMD &= ~UCMD_RUN_STOP;
+	while (UOG_USBCMD & UCMD_RUN_STOP)
+		msleep(5);
+
+	UOG_USBCMD |= UCMD_RESET;
+	while ((UOG_USBCMD) & (UCMD_RESET))
+		msleep(5);
+
+	/* allow controller to reset, and leave time for
+	 * the ULPI transceiver to reset too.
+	 */
+	msleep(100);
+
+	/* Probably disables charger detect interrupt again */
+	mx50_anadig_clr();
+
+	enable_irq(37);
+
+	/* Disable accessory charging */
+	// accessory_charger_disable();
+
+	return 0;
+}
+
+EXPORT_SYMBOL(usbotg_low_power_exit);
 
 int usbotg_init(struct platform_device *pdev)
 {
 	struct fsl_usb2_platform_data *pdata = pdev->dev.platform_data;
 	struct fsl_xcvr_ops *xops;
+	int ret;
 
 	pr_debug("%s: pdev=0x%p  pdata=0x%p\n", __func__, pdev, pdata);
 
@@ -800,7 +946,19 @@ int usbotg_init(struct platform_device *pdev)
 	pdata->xcvr_type = xops->xcvr_type;
 	pdata->pdev = pdev;
 
-	if (!otg_used) {
+	/* Ensure we are not in low power suspend.
+	 * Maybe we need to skip other initialisation steps when in low power suspend?
+	 */
+	if (otg_init_cnt && !otg_use_cnt) {
+		/* HACK: someone has already initialised the USB device, but is currently not
+		 * using it. Wake the controller up from low power suspend. */
+		ret = usbotg_low_power_exit();
+		if (ret)
+			return ret;
+		otg_use_cnt--;
+	}
+
+	if (!otg_init_cnt) {
 		if (fsl_check_usbclk() != 0)
 			return -EINVAL;
 		if (cpu_is_mx50())
@@ -839,7 +997,8 @@ int usbotg_init(struct platform_device *pdev)
 	if (usb_register_remote_wakeup(pdev))
 		pr_debug("DR is not a wakeup source.\n");
 
-	otg_used++;
+	otg_init_cnt++;
+	otg_use_cnt++;
 	pr_debug("%s: success\n", __func__);
 	return 0;
 }
@@ -860,30 +1019,28 @@ int otg_set_resources(struct resource *resources)
 }
 EXPORT_SYMBOL(otg_set_resources);
 
-void usbotg_uninit(struct fsl_usb2_platform_data *pdata)
-{
-	pr_debug("%s\n", __func__);
-
-	otg_used--;
-	if (!otg_used) {
+void usbotg_uninit_port(struct fsl_usb2_platform_data *pdata) {
+	otg_init_cnt--;
+	if (!otg_init_cnt) {
 		if (pdata->xcvr_ops && pdata->xcvr_ops->uninit)
 			pdata->xcvr_ops->uninit(pdata->xcvr_ops);
 
 		pdata->regs = NULL;
 
-		if (machine_is_mx31_3ds()) {
-			if (pdata->xcvr_ops && pdata->xcvr_ops->suspend)
-				pdata->xcvr_ops->suspend(pdata->xcvr_ops);
-			clk_disable(usb_clk);
-		}
-		msleep(1);
-		UOG_PORTSC1 = UOG_PORTSC1 | PORTSC_PHCD;
-		if (pdata->gpio_usb_inactive)
-			pdata->gpio_usb_inactive();
-		if (pdata->xcvr_type == PORTSC_PTS_SERIAL)
-			clk_disable(usb_clk);
-		clk_disable(usb_ahb_clk);
+		/* Removed all the suspend/LPM stuff from here as
+		 * fsl_udc_suspend should do the job just fine;
+		 * let's hope it works.
+		 */
 	}
+}
+EXPORT_SYMBOL(usbotg_uninit_port);
+
+void usbotg_uninit(struct fsl_usb2_platform_data *pdata)
+{
+	pr_debug("%s\n", __func__);
+
+	usbotg_low_power_enter();
+	usbotg_uninit_port(pdata);
 }
 EXPORT_SYMBOL(usbotg_uninit);
 

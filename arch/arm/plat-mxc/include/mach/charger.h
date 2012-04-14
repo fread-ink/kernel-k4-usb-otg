@@ -25,12 +25,6 @@
 #ifndef CHARGER_H_
 #define CHARGER_H_
 
-enum charger_status {
-	CHARGER_STATE_UNDEFINED = 0,
-	CHARGER_STATE_DISCONNECTED = 0,
-	CHARGER_STATE_CONNECTED
-};
-
 #define N_CHARGER_EVENTS 2
 enum charger_event {
 	CHARGER_CONNECT_EVENT = 0,
@@ -48,6 +42,6 @@ int charger_have_low_battery(void);
 
 int charger_get_battery_current(int *curr);
 
-enum charger_status is_charger_connected(void);
+int is_charger_connected(void);
 
 #endif /* CHARGER_H_ */

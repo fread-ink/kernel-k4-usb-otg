@@ -15,9 +15,12 @@
  * 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#include "otg_fsm.h"
 #include <linux/usb/otg.h>
 #include <linux/ioctl.h>
+
+#include "otg_fsm.h"
+
+#define ID_PIN_DEFAULT 0
 
  /* USB Command  Register Bit Masks */
 #define USB_CMD_RUN_STOP		(0x1<<0  )
@@ -354,39 +357,14 @@ struct usb_dr_mmap {
 	u32 control;		/* General Purpose Control Register */
 };
 
-
-struct fsl_otg_timer {
-	unsigned long expires;	/* Number of count increase to timeout */
-	unsigned long count;	/* Tick counter */
-	void (*function)(unsigned long);	/* Timeout function */
-	unsigned long data;	/* Data passed to function */
-	struct list_head list;
-};
-
-struct fsl_otg_timer inline *otg_timer_initializer
-(void (*function)(unsigned long), unsigned long expires, unsigned long data)
-{
-	struct fsl_otg_timer *timer;
-	timer = kmalloc(sizeof(struct fsl_otg_timer), GFP_KERNEL);
-	if (timer == NULL)
-		return NULL;
-	timer->function = function;
-	timer->expires = expires;
-	timer->data = data;
-	return timer;
-}
-
 struct fsl_otg {
 	struct otg_transceiver otg;
 	struct otg_fsm fsm;
 	struct usb_dr_mmap *dr_mem_map;
-	struct delayed_work otg_event;
 
-	/*used for usb host */
-	struct work_struct work_wq;
-	u8	host_working;
+	int id_pin_override;
 
-	int irq;
+	struct delayed_work statemachine_work;
 };
 
 struct fsl_otg_config {
