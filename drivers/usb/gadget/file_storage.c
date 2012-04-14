@@ -340,8 +340,8 @@ MODULE_PARM_DESC(recovery_mode, "recovery util mode");
 	dev_info(&(d)->gadget->dev , fmt , ## args)
 
 #if defined(CONFIG_MACH_MX50_TEQUILA)
-#define ICHRG_VALUE_HIGH	5	/* As defined by Atlas - maps to 480mA */
-#define ICHRG_VALUE_FULL	1	/* maps to 80mA */
+#define ICHRG_VALUE_HIGH	500
+#define ICHRG_VALUE_FULL	100
 #define FSG_THREAD_NICE_LEVEL	(-20)
 #endif
 

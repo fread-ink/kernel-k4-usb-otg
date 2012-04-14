@@ -134,6 +134,28 @@ DECLARE_DELAYED_WORK(charger_misc_work, do_charger_misc_work);
 DECLARE_WORK(charger_statemachine_work, do_charger_statemachine_work);
 DECLARE_WORK(lobat_work, do_lobat_work);
 
+struct charge_config {
+	u8  ichrg_value;
+	u16 current_limit_mA;
+};
+
+#define N_CHARGE_CONFIGS 3
+
+static struct charge_config charge_configs[] = {
+		{
+				.ichrg_value = 0,
+				.current_limit_mA = 0
+		},
+		{
+				.ichrg_value = 1,
+				.current_limit_mA = 100
+		},
+		{
+				.ichrg_value = 5,
+				.current_limit_mA = 500
+		}
+};
+
 enum chg_setting {
 	BAT_TH_CHECK_DIS,
 	AUTO_CHG_DIS,
@@ -351,6 +373,40 @@ int charger_connected(void)
 	pr_debug("%s: %d\n", __func__, ret);
 
 	return ret;
+}
+
+static int charger_milliamps_to_ichrg_value(int current_limit)
+{
+	int i = 0;
+	int safe_ichrg_value = -1;
+
+	while ((i < N_CHARGE_CONFIGS)
+			&& charge_configs[i].current_limit_mA <= current_limit) {
+
+		safe_ichrg_value = charge_configs[i].ichrg_value;
+		i++;
+	}
+
+	if (safe_ichrg_value == -1) {
+		printk(KERN_ERR "Unable to find a suitable charge register value for current limit %d",
+				current_limit);
+
+		return -EINVAL;
+	}
+
+	return safe_ichrg_value;
+}
+
+static unsigned int charger_ichrg_value_to_milliamps(int ichrg_value)
+{
+	int i;
+
+	for (i = 0; i < N_CHARGE_CONFIGS; i++) {
+		if (charge_configs[i].ichrg_value == ichrg_value)
+			return charge_configs[i].current_limit_mA;
+	}
+
+	return 0;
 }
 
 static int pmic_set_chg_current(unsigned short curr)
@@ -658,20 +714,18 @@ int charger_event_unsubscribe(enum charger_event event, void (*callback_func)(vo
 EXPORT_SYMBOL(charger_event_unsubscribe);
 
 int charger_set_current_limit(unsigned int mA) {
-	/*
-	 * TODO: What is passed in here are not really Milli-Amperes, but
-	 * actually the raw values that we are going to write to REG_CHARGE
-	 * in order to achieve the desired charge current.
-	 * Actually pass in Milli-Amperes here and map them to the correct
-	 * values for REG_CHARGER using a lookup table or perhaps a formula.
-	 */
-	max_charge_current = mA;
+	max_charge_current = charger_milliamps_to_ichrg_value(mA);
 
-	DBG("current limit set to %d\n", max_charge_current);
+	DBG("current limit set to %d, mA=%u\n", max_charge_current, mA);
 
 	return charger_adjust_charge_current();
 }
 EXPORT_SYMBOL(charger_set_current_limit);
+
+unsigned int charger_get_current_limit(void) {
+	return charger_ichrg_value_to_milliamps(max_charge_current);
+}
+EXPORT_SYMBOL(charger_get_current_limit);
 
 int charger_get_charge_current(void) {
 	return charge_current;

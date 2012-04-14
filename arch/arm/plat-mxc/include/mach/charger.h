@@ -35,6 +35,7 @@ void charger_event_subscribe(enum charger_event event, void (*callback_func)(voi
 		void *param);
 int charger_event_unsubscribe(enum charger_event event, void (*callback_func)(void *param));
 
+unsigned int charger_get_current_limit(void);
 int charger_set_current_limit(unsigned int mA);
 int charger_get_charge_current(void);
 int charger_have_critical_battery(void);

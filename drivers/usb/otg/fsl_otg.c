@@ -637,10 +637,9 @@ static ssize_t
 id_pin_override_store(struct device *dev, struct device_attribute *attr,
 				const char *buf, size_t size)
 {
-	char *endp;
 	long id_pin_override_long;
 
-	id_pin_override_long = simple_strtol(buf, &endp, 10);
+	id_pin_override_long = simple_strtol(buf, NULL, 10);
 	if (id_pin_override_long < -1 || id_pin_override_long > 1)
 		return -EINVAL;
 
@@ -650,6 +649,32 @@ id_pin_override_store(struct device *dev, struct device_attribute *attr,
 }
 
 static DEVICE_ATTR(id_pin_override, 0644, id_pin_override_show, id_pin_override_store);
+
+static ssize_t
+charge_current_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", charger_get_current_limit());
+}
+
+static ssize_t
+charge_current_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t size)
+{
+	unsigned long charge_current;
+	int retval;
+
+	charge_current = simple_strtoul(buf, NULL, 10);
+	if (charge_current > ((1 << 31) - 1))
+		return -EINVAL;
+
+	retval = charger_set_current_limit(charge_current);
+	if (retval)
+		return retval;
+
+	return size;
+}
+
+static DEVICE_ATTR(charge_current, 0644, charge_current_show, charge_current_store);
 
 static int __init fsl_otg_probe(struct platform_device *pdev)
 {
@@ -677,7 +702,10 @@ static int __init fsl_otg_probe(struct platform_device *pdev)
 	}
 
 	if (device_create_file(&pdev->dev, &dev_attr_id_pin_override) < 0)
-			dev_err(&pdev->dev, "Could not create id_pin_override device attribute.\n");
+		dev_err(&pdev->dev, "Could not create id_pin_override device attribute.\n");
+
+	if (device_create_file(&pdev->dev, &dev_attr_charge_current) < 0)
+		dev_err(&pdev->dev, "Could not create charge_current device attribute.\n");
 
 	create_proc_file();
 	return status;
@@ -689,6 +717,7 @@ static int fsl_otg_remove(struct platform_device *pdev)
 	int retval;
 
 	device_remove_file(&pdev->dev, &dev_attr_id_pin_override);
+	device_remove_file(&pdev->dev, &dev_attr_charge_current);
 
 	if ((retval = charger_event_unsubscribe(CHARGER_CONNECT_EVENT, &callback_connect_event)))
 			return retval;

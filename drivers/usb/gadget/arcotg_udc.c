@@ -78,8 +78,8 @@
 
 #define	DMA_ADDR_INVALID	(~(dma_addr_t)0)
 
-#define CHARGING_THIRD_PARTY   0x5     /* Third party chargers */
-#define CHARGING_HOST 0x1
+#define CHARGING_THIRD_PARTY   500     /* Third party chargers */
+#define CHARGING_HOST          100
 
 static const char driver_name[] = "fsl-usb2-udc";
 static const char driver_desc[] = DRIVER_DESC;
