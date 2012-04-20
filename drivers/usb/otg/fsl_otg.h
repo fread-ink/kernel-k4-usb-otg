@@ -363,6 +363,8 @@ struct fsl_otg {
 	struct usb_dr_mmap *dr_mem_map;
 
 	int id_pin_override;
+
+	struct delayed_work statemachine_work;
 };
 
 struct fsl_otg_config {
