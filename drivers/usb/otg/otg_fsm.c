@@ -173,6 +173,12 @@ int otg_statemachine(struct otg_fsm *fsm)
 		break;
 	case OTG_STATE_HOST:
 		if (!fsm->host_available || !fsm->vbus_vld) {
+			if (!fsm->vbus_vld) {
+				/* need to leave some time for the USB host to finish
+				 * disconnect interrupt processing.
+				 */
+				msleep(500);
+			}
 			retval = otg_set_state(fsm, OTG_STATE_IDLE);
 		} else if (fsm->id) {
 			retval = otg_set_state(fsm, OTG_STATE_GADGET);

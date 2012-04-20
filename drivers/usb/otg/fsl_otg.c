@@ -145,12 +145,6 @@ static inline int fsl_otg_get_id_pin(struct fsl_otg *otg_dev)
 		return fsl_otg_read_id_pin();
 }
 
-static void do_statemachine_work(struct work_struct *work)
-{
-	struct fsl_otg *otg_dev = container_of(work, struct fsl_otg, statemachine_work.work);
-	otg_statemachine(&otg_dev->fsm);
-}
-
 /* -------------------------------------------------------------*/
 /* Operations that will be called from OTG Finite State Machine */
 
@@ -367,11 +361,7 @@ static void callback_connect_event(void *param) {
 	fsm->vbus_vld = is_charger_connected();
 	DBG("Charger connect event. charger connected=%d\n", fsm->vbus_vld);
 
-	if (fsm->vbus_vld)
-		otg_statemachine(fsm);
-	else
-		/* leave time for KHubd to finish disconnect processing before suspending the host */
-		schedule_delayed_work(&otg_dev->statemachine_work, msecs_to_jiffies(100));
+	otg_statemachine(fsm);
 }
 
 /* Set OTG port power, only for B-device */
@@ -409,7 +399,6 @@ static int fsl_otg_conf(struct platform_device *pdev)
 		return -ENODEV;
 
 	mutex_init(&fsl_otg_tc->fsm.state_mutex);
-	INIT_DELAYED_WORK(&fsl_otg_tc->statemachine_work, do_statemachine_work);
 
 	/* Set OTG state machine operations */
 	fsl_otg_tc->fsm.ops = &fsl_otg_ops;
