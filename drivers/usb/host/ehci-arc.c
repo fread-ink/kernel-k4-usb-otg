@@ -574,10 +574,10 @@ static void ehci_fsl_drv_shutdown(struct platform_device *pdev)
 		}
 	}
 
+	usb_remove_hcd(hcd);
+
 	/* DDD shouldn't we turn off the power here? */
 	fsl_platform_set_vbus_power(pdata, 0);
-
-	usb_remove_hcd(hcd);
 
 	usbotg_low_power_enter();
 
