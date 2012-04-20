@@ -3279,6 +3279,59 @@ static int snd_usb_audigy2nx_boot_quirk(struct usb_device *dev)
 }
 
 /*
+* High-Speed quirk for SB X-Fi Surround 51 Pro
+*/
+static int snd_usb_x_fi_surround_51_boot_quirk(struct usb_device *dev)
+{
+	u16 buf = 1;
+	int err;
+
+	snd_printk(KERN_ERR "Applying the SB1095 boot quirk\n");
+
+	err = snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0), 0x2a,
+			USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_OTHER,
+			0, 0, &buf, 2, 1000);
+
+	if (err < 0) {
+		snd_printk(KERN_ERR "Got error code %d from snd_usb_ctl_msg\n", err);
+		return err;
+	}
+
+	snd_printk(KERN_ERR "SB1095 boot quirk: Received response 0x%x from sound card\n", buf);
+
+	if (buf == 0) {
+		buf = 1;
+		snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0), 0x2a,
+			USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_OTHER,
+			0, 0, &buf, 2, 1000);
+
+		if (err < 0) {
+			snd_printk(KERN_ERR "Got error code %d from snd_usb_ctl_msg\n", err);
+			return err;
+		} else if (buf != 0) {
+			snd_printk(KERN_ERR "Unexpected response in SB1095 Hi-Speed boot quirk sequence: 0x%x where 0 was expected\n", buf);
+			return -EINVAL;
+		}
+
+		/* this message will cause the sound card to reconnect in high-speed mode */
+		err = snd_usb_ctl_msg(dev, usb_sndctrlpipe(dev, 0), 0x29,
+				USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_OTHER,
+				1, 2000, NULL, 0, 1000);
+
+		if (err < 0) {
+			snd_printk(KERN_ERR "Got error code %d from snd_usb_ctl_msg\n", err);
+			return err;
+		}
+
+		return -ENODEV;
+	}
+
+	snd_printk("Applying the SB1095 quirk was successful!\n");
+
+	return 0;
+}
+
+/*
  * C-Media CM106/CM106+ have four 16-bit internal registers that are nicely
  * documented in the device's data sheet.
  */
@@ -3599,6 +3652,10 @@ static void *snd_usb_audio_probe(struct usb_device *dev,
 	/* SB Audigy 2 NX needs its own boot-up magic, too */
 	if (id == USB_ID(0x041e, 0x3020)) {
 		if (snd_usb_audigy2nx_boot_quirk(dev) < 0)
+			goto __err_val;
+	}
+	if (id == USB_ID(0x041e, 0x30df)) {
+		if (snd_usb_x_fi_surround_51_boot_quirk(dev) < 0)
 			goto __err_val;
 	}
 
