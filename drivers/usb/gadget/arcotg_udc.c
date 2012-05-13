@@ -103,8 +103,6 @@ extern int mxc_spi_suspended;
 
 extern void mxc_kernel_uptime(void);
 
-static struct ep_td_struct *last_free_td;
-
 atomic_t charger_atomic_detection = ATOMIC_INIT(0);
 
 static const struct usb_endpoint_descriptor
@@ -393,14 +391,9 @@ static void done(struct fsl_ep *ep, struct fsl_req *req, int status)
 		curr_td = next_td;
 		if (j != req->dtd_count - 1) {
 			next_td = curr_td->next_td_virt;
+		}
 
-			 dma_pool_free(udc->td_pool, curr_td, curr_td->td_dma);
-                } else {
-                        if (last_free_td != NULL)
-                                dma_pool_free(udc->td_pool, last_free_td,
-                                                last_free_td->td_dma);
-                        last_free_td = curr_td;
-                }
+		dma_pool_free(udc->td_pool, curr_td, curr_td->td_dma);
 	}
 
 	if (USE_MSC_WR(req->req.length)) {
@@ -600,8 +593,6 @@ static void dr_controller_stop(struct fsl_udc *udc)
 	unsigned int tmp;
 
 	DBG("%s\n", __func__);
-
-	last_free_td = NULL;
 
 	udc_suspend(udc);
 
@@ -2398,9 +2389,6 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 		}
 
 		(void)otg_set_peripheral(udc_controller->transceiver, 0);
-	} else {
-		/* stop DR, disable intr */
-		dr_controller_stop(udc_controller);
 	}
 
 	/* in fact, no needed */
@@ -2415,6 +2403,8 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 	list_for_each_entry(loop_ep, &udc_controller->gadget.ep_list,
 			ep.ep_list)
 		nuke(loop_ep, -ESHUTDOWN);
+	/* stop DR, disable intr */
+	dr_controller_stop(udc_controller);
 	spin_unlock_irqrestore(&udc_controller->lock, flags);
 
 	if (udc_controller->transceiver) {
