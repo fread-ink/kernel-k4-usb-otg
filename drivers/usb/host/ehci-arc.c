@@ -522,11 +522,11 @@ static int ehci_fsl_drv_startup(struct platform_device *pdev)
 	fsl_platform_set_host_mode(hcd);
 	hcd->power_budget = pdata->power_budget;
 
+	fsl_platform_set_vbus_power(pdata, 1);
+
 	retval = usb_add_hcd(hcd, pdata->irq, IRQF_DISABLED | IRQF_SHARED);
 	if (retval != 0)
 		return retval;
-
-	fsl_platform_set_vbus_power(pdata, 1);
 
 	if (pdata->suspended) {
 		pdata->suspended = 0;
