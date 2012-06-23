@@ -702,6 +702,37 @@ static void usb_mixer_elem_free(struct snd_kcontrol *kctl)
  */
 
 /*
+ * Since the i.mx 5 SoC does no seem to cope properly with stalls
+ * during a USB transaction, we have to prevent stalls on the
+ * USB bus. These stalls occur if a SET_RES command is not supported
+ * by the device(see USB audio spec). So we try to catch unsupported
+ * SET_RES commands and keep them from going over the bus.
+ */
+static int is_set_res_supported(struct usb_mixer_elem_info *cval)
+{
+	switch (cval->mixer->chip->usb_id) {
+	case USB_ID(0x041e, 0x3020):
+	case USB_ID(0x041e, 0x3048): /* Creative SoundBlaster Audigy 2 NX */
+		if (cval->control == USB_FEATURE_VOLUME) {
+			switch (cval->id) {
+			case 0x06:
+			case 0x08:
+			case 0x12:
+			case 0x0b:
+			case 0x0c:
+			case 0x0d:
+				return false;
+			default:
+				return true;
+			}
+		}
+		return true;
+	default:
+		return true;
+	}
+}
+
+/*
  * retrieve the minimum and maximum values for the specified control
  */
 static int get_min_max(struct usb_mixer_elem_info *cval, int default_min)
@@ -735,10 +766,15 @@ static int get_min_max(struct usb_mixer_elem_info *cval, int default_min)
 		} else {
 			int last_valid_res = cval->res;
 
-			while (cval->res > 1) {
-				if (set_ctl_value(cval, SET_RES, (cval->control << 8) | minchn, cval->res / 2) < 0)
-					break;
-				cval->res /= 2;
+			if (is_set_res_supported(cval)) {
+				while (cval->res > 1) {
+					if (set_ctl_value(cval, SET_RES, (cval->control << 8) | minchn, cval->res / 2) < 0) {
+						printk(KERN_DEBUG "Cannot set ctl value 0x%x for mixer %x\n",
+								cval->control, cval->mixer->ctrlif);
+						break;
+					}
+					cval->res /= 2;
+				}
 			}
 			if (get_ctl_value(cval, GET_RES, (cval->control << 8) | minchn, &cval->res) < 0)
 				cval->res = last_valid_res;
