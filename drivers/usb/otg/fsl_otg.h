@@ -352,7 +352,7 @@ struct usb_dr_mmap {
 	u32 si_ctrl;		/* System Interface Control Register */
 	u8 res10[236];
 #ifdef CONFIG_ARCH_MX5
-	u32 res11[128];
+	u32 res11[192];
 #endif
 	u32 control;		/* General Purpose Control Register */
 };
