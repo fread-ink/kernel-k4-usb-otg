@@ -668,7 +668,7 @@ charge_current_store(struct device *dev, struct device_attribute *attr,
 	int retval;
 
 	charge_current = simple_strtoul(buf, NULL, 10);
-	if (charge_current > ((1 << 31) - 1))
+	if (charge_current > ((1UL << 31) - 1))
 		return -EINVAL;
 
 	retval = charger_set_current_limit(charge_current);
