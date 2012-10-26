@@ -2420,14 +2420,6 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 	dr_controller_stop(udc_controller);
 	spin_unlock_irqrestore(&udc_controller->lock, flags);
 
-	if (udc_controller->transceiver) {
-		/* release the port handle for the EP flush work */
-		if ((ret = usbotg_low_power_enter())) {
-			printk(KERN_ERR "%s: ERROR: Could not enter low power mode. Error=%d. Not fatal.",
-					__func__, ret);
-		}
-	}
-
 	if (driver->disconnect)
 		driver->disconnect(&udc_controller->gadget);
 
@@ -2435,6 +2427,14 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 	driver->unbind(&udc_controller->gadget);
 	udc_controller->gadget.dev.driver = 0;
 	udc_controller->driver = 0;
+
+	if (udc_controller->transceiver) {
+		/* release the port handle for the EP flush work */
+		if ((ret = usbotg_low_power_enter())) {
+			printk(KERN_ERR "%s: ERROR: Could not enter low power mode. Error=%d. Not fatal.",
+					__func__, ret);
+		}
+	}
 
 	printk(KERN_DEBUG "unregistered gadget driver '%s'\r\n",
 	       driver->driver.name);
