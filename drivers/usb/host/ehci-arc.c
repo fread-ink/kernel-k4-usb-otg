@@ -524,7 +524,7 @@ static int ehci_fsl_drv_startup(struct platform_device *pdev)
 
 	fsl_platform_set_vbus_power(pdata, 1);
 
-	retval = usb_add_hcd(hcd, pdata->irq, IRQF_DISABLED | IRQF_SHARED);
+	retval = usb_add_hcd(hcd, pdata->irq, IRQF_SHARED);
 	if (retval != 0)
 		return retval;
 
