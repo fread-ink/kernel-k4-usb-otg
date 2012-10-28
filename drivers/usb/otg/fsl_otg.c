@@ -727,16 +727,17 @@ static int fsl_otg_remove(struct platform_device *pdev)
 			return retval;
 
 	otg_set_transceiver(NULL);
-	iounmap((void *)usb_dr_regs);
-
-	kfree(fsl_otg_dev);
 
 	remove_proc_file();
 
 	unregister_chrdev(FSL_OTG_MAJOR, FSL_OTG_NAME);
 
-	if ((retval = fsl_otg_enable_port(&fsl_otg_dev->fsm, 0)))
-		return retval;
+	fsl_otg_dev->fsm.term_requested = 1;
+	otg_statemachine(&fsl_otg_dev->fsm);
+
+	iounmap((void *)usb_dr_regs);
+
+	kfree(fsl_otg_dev);
 
 	usbotg_uninit_port(pdata);
 

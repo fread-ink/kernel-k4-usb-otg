@@ -44,6 +44,7 @@ struct otg_fsm {
 	int id;
 	int gadget_available;
 	int host_available;
+	int term_requested;
 
 	struct otg_fsm_ops *ops;
 	struct otg_transceiver *transceiver;
@@ -58,5 +59,4 @@ struct otg_fsm_ops {
 };
 
 int otg_statemachine(struct otg_fsm *fsm);
-int otg_set_state(struct otg_fsm *fsm, enum usb_otg_state new_state);
 
