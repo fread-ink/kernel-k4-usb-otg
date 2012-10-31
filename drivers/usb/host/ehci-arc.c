@@ -178,7 +178,7 @@ int usb_hcd_fsl_probe(const struct hc_driver *driver,
 	struct fsl_usb2_platform_data *pdata;
 	struct usb_hcd *hcd;
 	struct resource *res;
-	int retval;
+	int retval = 0;
 	struct device *ehci_arc_dev;
 
 	pr_debug("initializing FSL-SOC USB Controller\n");
@@ -256,7 +256,6 @@ int usb_hcd_fsl_probe(const struct hc_driver *driver,
 		goto err4;
 	}
 
-	pdata->is_active = 0;
 	mutex_init(&pdata->suspend_lock);
 
 	if (pdata->operating_mode == FSL_USB2_DR_OTG) {
@@ -273,6 +272,9 @@ int usb_hcd_fsl_probe(const struct hc_driver *driver,
 			goto err5;
 		}
 
+		pdata->suspended = 1;
+		pdata->already_suspended = 0;
+
 		retval = otg_set_host(ehci->transceiver, &ehci_to_hcd(ehci)->self);
 		if (retval)
 			otg_put_transceiver(ehci->transceiver);
@@ -280,6 +282,9 @@ int usb_hcd_fsl_probe(const struct hc_driver *driver,
 		if ((retval = ehci_fsl_drv_startup(pdev))) {
 			goto err5;
 		}
+
+		pdata->suspended = 0;
+		pdata->already_suspended = 0;
 	}
 
 	ehci_arc_dev = &pdev->dev;
@@ -509,14 +514,6 @@ static int ehci_fsl_drv_startup(struct platform_device *pdev)
 	struct fsl_usb2_platform_data *pdata = pdev->dev.platform_data;
 	int retval;
 
-	mutex_lock(&pdata->suspend_lock);
-	printk(KERN_DEBUG "%s: Entry. is_active=%d\n", __func__, pdata->is_active);
-
-	if (pdata->is_active) {
-		mutex_unlock(&pdata->suspend_lock);
-		return 0;
-	}
-
 	usbotg_low_power_exit();
 
 	fsl_platform_set_host_mode(hcd);
@@ -528,17 +525,8 @@ static int ehci_fsl_drv_startup(struct platform_device *pdev)
 	if (retval != 0)
 		return retval;
 
-	if (pdata->suspended) {
-		pdata->suspended = 0;
-		if (pdata->already_suspended)
-			pdata->already_suspended = 0;
-	}
-
 	fsl_platform_set_ahb_burst(hcd);
 	ehci_testmode_init(hcd_to_ehci(hcd));
-
-	pdata->is_active = 1;
-	mutex_unlock(&pdata->suspend_lock);
 
 	return 0;
 }
@@ -549,14 +537,6 @@ static void ehci_fsl_drv_shutdown(struct platform_device *pdev)
 	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
 	struct fsl_usb2_platform_data *pdata = pdev->dev.platform_data;
 	u32 tmp;
-
-	mutex_lock(&pdata->suspend_lock);
-	printk(KERN_DEBUG "%s: Entry. is_active=%d\n", __func__, pdata->is_active);
-
-	if (!pdata->is_active) {
-		mutex_unlock(&pdata->suspend_lock);
-		return;
-	}
 
 	if (!test_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags)) {
 		/* Need open clock for register access */
@@ -580,25 +560,9 @@ static void ehci_fsl_drv_shutdown(struct platform_device *pdev)
 	fsl_platform_set_vbus_power(pdata, 0);
 
 	usbotg_low_power_enter();
-
-	pdata->is_active = 0;
-	mutex_unlock(&pdata->suspend_lock);
 }
 
-#ifdef CONFIG_PM
 /* suspend/resume, section 4.3 */
-
-static int ehci_fsl_drv_deep_suspend(struct platform_device *pdev,
-		pm_message_t message)
-{
-	ehci_fsl_drv_shutdown(pdev);
-	return 0;
-}
-
-static int ehci_fsl_drv_deep_resume(struct platform_device *pdev)
-{
-	return ehci_fsl_drv_startup(pdev);
-}
 
 /* These routines rely on the bus (pci, platform, etc)
  * to handle powerdown and wakeup, and currently also on
@@ -608,8 +572,7 @@ static int ehci_fsl_drv_deep_resume(struct platform_device *pdev)
  * It is still to be decided if these routines are going to
  * continue to coexist with the OTG suspend/resume routines.
  */
-static int ehci_fsl_drv_suspend(struct platform_device *pdev,
-				pm_message_t message)
+static int ehci_fsl_enter_susp(struct platform_device *pdev)
 {
 	struct usb_hcd *hcd = platform_get_drvdata(pdev);
 	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
@@ -632,21 +595,6 @@ static int ehci_fsl_drv_suspend(struct platform_device *pdev,
 	       "mode=%d  usbcmd %08x\n", __func__, pdata->name,
 	       pdata->suspended, pdata->already_suspended, mode, tmp);
 #endif
-
-	/*
-	 * If the controller is already suspended, then this must be a
-	 * PM suspend.  Remember this fact, so that we will leave the
-	 * controller suspended at PM resume time.
-	 */
-	if (pdata->suspended) {
-		pr_debug("%s: already suspended, leaving early\n", __func__);
-		pdata->already_suspended = 1;
-		goto err1;
-	}
-
-	pr_debug("%s: suspending...\n", __func__);
-
-	printk(KERN_INFO "USB Host suspended\n");
 
 	pdev->dev.power.power_state = PMSG_SUSPEND;
 
@@ -672,8 +620,6 @@ static int ehci_fsl_drv_suspend(struct platform_device *pdev,
 	/* clear PHCD bit */
 	pdata->pm_portsc &= ~PORT_PHCD;
 
-	pdata->suspended = 1;
-
 	if (!device_may_wakeup(&(pdev->dev))) {
 		/* clear PP to cut power to the port */
 		tmp = ehci_readl(ehci, &ehci->regs->port_status[0]);
@@ -694,30 +640,12 @@ err1:
 	return 0;
 }
 
-static int ehci_fsl_drv_resume(struct platform_device *pdev)
+static int ehci_fsl_exit_susp(struct platform_device *pdev)
 {
+	struct fsl_usb2_platform_data *pdata = pdev->dev.platform_data;
 	struct usb_hcd *hcd = platform_get_drvdata(pdev);
 	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
 	u32 tmp;
-	struct fsl_usb2_platform_data *pdata = pdev->dev.platform_data;
-
-	pr_debug("%s('%s'): suspend=%d already_suspended=%d\n", __func__,
-		pdata->name, pdata->suspended, pdata->already_suspended);
-
-	/*
-	 * If the controller was already suspended at suspend time,
-	 * then don't resume it now.
-	 */
-	if (pdata->already_suspended) {
-		pr_debug("already suspended, leaving early\n");
-		pdata->already_suspended = 0;
-		return 0;
-	}
-
-	if (!pdata->suspended) {
-		pr_debug("not suspended, leaving early\n");
-		return 0;
-	}
 
 	/* If hcd is resumed by non-usb wakeup events,
 	 * then usb clocks are still not open when come here */
@@ -728,8 +656,6 @@ static int ehci_fsl_drv_resume(struct platform_device *pdev)
 	}
 
 	tmp = ehci_readl(ehci, &ehci->regs->port_status[0]);
-
-	pdata->suspended = 0;
 
 	pr_debug("%s resuming...\n", __func__);
 
@@ -765,8 +691,6 @@ static int ehci_fsl_drv_resume(struct platform_device *pdev)
 
 	usb_hcd_resume_root_hub(hcd);
 
-	printk(KERN_INFO "USB Host resumed\n");
-
 	if (device_may_wakeup(&(pdev->dev))) {
 		if (pdata->usb_clock_for_pm)
 			pdata->usb_clock_for_pm(false);
@@ -774,7 +698,106 @@ static int ehci_fsl_drv_resume(struct platform_device *pdev)
 
 	return 0;
 }
-#endif				/* CONFIG_USB_OTG */
+
+static int ehci_fsl_drv_suspend(struct platform_device *pdev,
+				pm_message_t message)
+{
+	struct device *dev = &pdev->dev;
+	struct fsl_usb2_platform_data *pdata = dev->platform_data;
+	int retval = 0;
+
+	mutex_lock(&pdata->suspend_lock);
+
+	/*
+	 * If the controller is already suspended, then this must be a
+	 * PM suspend.  Remember this fact, so that we will leave the
+	 * controller suspended at PM resume time.
+	 */
+	if (pdata->suspended) {
+		pr_debug("%s: already suspended, leaving early\n", __func__);
+		pdata->already_suspended = 1;
+		goto out;
+	}
+
+	dev_info(dev, "%s: suspending...\n", __func__);
+
+	if (pdata->operating_mode == FSL_USB2_DR_OTG) {
+		ehci_fsl_drv_shutdown(pdev);
+	} else {
+		retval = ehci_fsl_enter_susp(pdev);
+	}
+
+	if (retval) {
+		dev_crit(dev, "%s: OTG resume failed. retval=%d", __func__, retval);
+		goto out;
+	}
+
+	pdata->suspended = 1;
+	dev_info(dev, "USB host suspended\n");
+
+out:
+	mutex_unlock(&pdata->suspend_lock);
+	return retval;
+}
+
+static int ehci_fsl_drv_otg_suspend(struct device *dev, pm_message_t message)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	return ehci_fsl_drv_suspend(pdev, message);
+}
+
+static int ehci_fsl_drv_resume(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct fsl_usb2_platform_data *pdata = dev->platform_data;
+	int retval = 0;
+
+	mutex_lock(&pdata->suspend_lock);
+
+	dev_info(dev, "%s('%s'): suspend=%d already_suspended=%d\n", __func__,
+			pdata->name, pdata->suspended,
+			pdata->already_suspended);
+
+	/*
+	 * If the controller was already suspended at suspend time,
+	 * then don't resume it now.
+	 */
+	if (pdata->already_suspended) {
+		dev_info(dev, "already suspended, leaving early\n");
+		pdata->already_suspended = 0;
+		goto out;
+	}
+
+	if (!pdata->suspended) {
+		dev_info(dev, "not suspended, leaving early\n");
+		goto out;
+	}
+
+	if (pdata->operating_mode == FSL_USB2_DR_OTG) {
+		retval = ehci_fsl_drv_startup(pdev);
+	} else {
+		retval = ehci_fsl_exit_susp(pdev);
+	}
+
+	if (retval) {
+		dev_crit(dev, "PM resume failed.\n");
+		goto out;
+	}
+
+	pdata->suspended = 0;
+
+	dev_info(dev, "USB Host resumed\n");
+
+out:
+	mutex_unlock(&pdata->suspend_lock);
+	return retval;
+}
+
+static int ehci_fsl_drv_otg_resume(struct device *dev)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	return ehci_fsl_drv_resume(pdev);
+}
 
 MODULE_ALIAS("platform:fsl-ehci");
 
@@ -783,10 +806,15 @@ static struct platform_driver ehci_fsl_driver = {
 	.remove = ehci_fsl_drv_remove,
 	.shutdown = usb_hcd_platform_shutdown,
 #ifdef CONFIG_PM
-	.suspend = ehci_fsl_drv_deep_suspend,
-	.resume = ehci_fsl_drv_deep_resume,
+	/* these are not usb suspend/resume */
+	.suspend = ehci_fsl_drv_suspend,
+	.resume = ehci_fsl_drv_resume,
 #endif
 	.driver = {
 		   .name = "fsl-ehci",
+
+		   /* called by OTG state machine */
+		   .suspend = ehci_fsl_drv_otg_suspend,
+		   .resume = ehci_fsl_drv_otg_resume,
 	},
 };

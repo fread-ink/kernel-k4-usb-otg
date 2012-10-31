@@ -544,6 +544,9 @@ struct fsl_ep {
 #define EP_DIR_IN	1
 #define EP_DIR_OUT	0
 
+#define PM_STATE_RUNNING     0
+#define PM_STATE_SUSPENDED   1
+
 struct fsl_udc {
 	struct usb_gadget gadget;
 	struct usb_gadget_driver *driver;
@@ -554,14 +557,16 @@ struct fsl_udc {
 
 	struct usb_ctrlrequest local_setup_buff;
 	spinlock_t lock;
-	struct mutex suspend_lock;
+	struct mutex fsm_lock;
 	u32 xcvr_type;
 	struct otg_transceiver *transceiver;
 	unsigned softconnect:1;
 	unsigned vbus_active:1;
 	unsigned stopped:1;
 	unsigned remote_wakeup:1;
-	unsigned lpm:1;
+	unsigned pm_state:1;
+	unsigned power_suspend_req:1;
+	unsigned otg_suspend_req:1;
 
 	struct ep_queue_head *ep_qh;	/* Endpoints Queue-Head */
 	struct fsl_req *status_req;	/* ep0 status request */

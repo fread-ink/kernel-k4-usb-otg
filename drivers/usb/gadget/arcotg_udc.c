@@ -130,8 +130,7 @@ static const size_t g_iram_size = IRAM_TD_PPH_SIZE;
 static void resume_ctrl(void);
 static int udc_suspend(struct fsl_udc *udc);
 static void do_charge_current_work(struct work_struct *work);
-static int low_power_enter(struct fsl_udc *udc);
-static int low_power_exit(struct fsl_udc *udc);
+static int fsl_udc_power_statemachine(struct fsl_udc *udc);
 static int fsl_udc_suspend(struct platform_device *dev, pm_message_t state);
 static int fsl_udc_resume(struct platform_device *dev);
 static void fsl_ep_fifo_flush(struct usb_ep *_ep);
@@ -3356,12 +3355,14 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 		goto err4;
 	}
 
-	mutex_init(&udc_controller->suspend_lock);
+	mutex_init(&udc_controller->fsm_lock);
 
 	if (udc_controller->transceiver) {
 		/* suspend the PHY until the gadget driver is loaded */
-		if ((ret = low_power_enter(udc_controller))) {
-			printk(KERN_ERR "%s: ERROR Could not enter low power idle. Exiting.\n", __func__);
+		udc_controller->otg_suspend_req = 1;
+		ret = fsl_udc_power_statemachine(udc_controller);
+		if (ret) {
+			printk(KERN_CRIT "%s: Error in power state machine. Exiting.\n", __func__);
 			goto err4;
 		}
 	}
@@ -3538,7 +3539,6 @@ static int __exit fsl_udc_remove(struct platform_device *pdev)
 	 * do platform specific un-initialization:
 	 * release iomux pins, etc.
 	 */
-	low_power_enter(udc_controller);
 	usbotg_uninit_port(pdata);
 
 	return 0;
@@ -3554,14 +3554,6 @@ static int udc_suspend(struct fsl_udc *udc)
 static int low_power_enter(struct fsl_udc *udc)
 {
 	int ret;
-
-	mutex_lock(&udc->suspend_lock);
-
-	if (udc->lpm) {
-		mutex_unlock(&udc->suspend_lock);
-
-		return 0;
-	}
 
 	printk(KERN_INFO "%s: Going into low power idle\n", __func__);
 
@@ -3587,23 +3579,12 @@ static int low_power_enter(struct fsl_udc *udc)
 		return ret;
 	}
 
-	udc->lpm = 1;
-	mutex_unlock(&udc->suspend_lock);
-
 	return 0;
 }
 
 static int low_power_exit(struct fsl_udc *udc)
 {
 	int ret;
-
-	mutex_lock(&udc->suspend_lock);
-
-	if (!udc->lpm) {
-		mutex_unlock(&udc->suspend_lock);
-
-		return 0;
-	}
 
 	printk(KERN_INFO "%s: Resuming PHY\n", __func__);
 
@@ -3625,14 +3606,61 @@ static int low_power_exit(struct fsl_udc *udc)
 	udc->ep0_state = WAIT_FOR_SETUP;
 	udc->ep0_dir = 0;
 
-	udc->lpm = 0;
-	mutex_unlock(&udc->suspend_lock);
-
 	if (is_charger_connected()) {
 		fsl_detect_charger_type();
 	}
 
 	return 0;
+}
+
+static int fsl_udc_enter_state(struct fsl_udc *udc, int state)
+{
+	int retval = 0;
+
+	switch (state) {
+	case PM_STATE_RUNNING:
+		retval = low_power_exit(udc);
+		break;
+	case PM_STATE_SUSPENDED:
+		retval = low_power_enter(udc);
+		break;
+	}
+
+	if (retval != 0) {
+		printk(KERN_CRIT "%s: Failure during OTG state switch. old state=%d, new state=%d, retval=%d\n",
+						__func__, udc->pm_state, state,
+						retval);
+
+		return retval;
+	}
+
+	udc->pm_state = state;
+	return 0;
+}
+
+static int fsl_udc_power_statemachine(struct fsl_udc *udc)
+{
+	int retval = 0;
+
+	mutex_lock(&udc->fsm_lock);
+
+	switch (udc->pm_state) {
+	case PM_STATE_RUNNING:
+		if (udc->power_suspend_req || udc->otg_suspend_req)
+			retval = fsl_udc_enter_state(udc, PM_STATE_SUSPENDED);
+		break;
+	case PM_STATE_SUSPENDED:
+		if (!udc->power_suspend_req && !udc->otg_suspend_req)
+			retval = fsl_udc_enter_state(udc, PM_STATE_RUNNING);
+		break;
+	default:
+		printk(KERN_CRIT "%s: Unknown state %d\n", __func__,
+				udc->pm_state);
+	}
+
+	mutex_unlock(&udc->fsm_lock);
+
+	return retval;
 }
 
 /*-----------------------------------------------------------------
@@ -3641,7 +3669,8 @@ static int low_power_exit(struct fsl_udc *udc)
  -----------------------------------------------------------------*/
 static int fsl_udc_suspend(struct platform_device *dev, pm_message_t state)
 {
-	return low_power_enter(udc_controller);
+	udc_controller->power_suspend_req = 1;
+	return fsl_udc_power_statemachine(udc_controller);
 }
 
 /*-----------------------------------------------------------------
@@ -3650,7 +3679,20 @@ static int fsl_udc_suspend(struct platform_device *dev, pm_message_t state)
  *-----------------------------------------------------------------*/
 static int fsl_udc_resume(struct platform_device *dev)
 {
-	return low_power_exit(udc_controller);
+	udc_controller->power_suspend_req = 0;
+	return fsl_udc_power_statemachine(udc_controller);
+}
+
+static int fsl_udc_otg_suspend(struct device *dev, pm_message_t state)
+{
+	udc_controller->otg_suspend_req = 1;
+	return fsl_udc_power_statemachine(udc_controller);
+}
+
+static int fsl_udc_otg_resume(struct device *dev)
+{
+	udc_controller->otg_suspend_req = 0;
+	return fsl_udc_power_statemachine(udc_controller);
 }
 
 static int arcotg_suspend(struct platform_device *pdev, pm_message_t state)
@@ -3692,6 +3734,10 @@ static struct platform_driver udc_driver = {
 	.driver  = {
 		.name = driver_name,
 		.owner = THIS_MODULE,
+
+		/* suspend/resume called by OTG driver */
+		.suspend = fsl_udc_otg_suspend,
+		.resume = fsl_udc_otg_resume,
 	},
 };
 

@@ -104,7 +104,6 @@ struct fsl_usb2_platform_data {
 	unsigned ahb_burst_mode:3;
 	unsigned			suspended : 1;
 	unsigned			already_suspended : 1;
-	unsigned            is_active : 1;
 
 	struct mutex    suspend_lock;
 
