@@ -792,7 +792,7 @@ static void otg_set_utmi_xcvr(void)
 
 #define VUSB2_VOTE_SOURCE_OTG  (1U << 1)
 
-DEFINE_MUTEX(otg_mutex);
+static DEFINE_MUTEX(otg_mutex);
 static int otg_init_cnt = 0;
 static int otg_use_cnt = 0;
 
