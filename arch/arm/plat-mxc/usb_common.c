@@ -792,6 +792,7 @@ static void otg_set_utmi_xcvr(void)
 
 #define VUSB2_VOTE_SOURCE_OTG  (1U << 1)
 
+DEFINE_MUTEX(otg_mutex);
 static int otg_init_cnt = 0;
 static int otg_use_cnt = 0;
 
@@ -801,16 +802,19 @@ extern void pmic_vusb2_enable_vote(int enable,int source);
 int usbotg_low_power_enter(void)
 {
 	struct clk *usb_phy1_clk;
+	int retval = 0;
 
+	mutex_lock(&otg_mutex);
 	printk(KERN_INFO "%s: begin. otg_use_cnt=%d\n", __func__, otg_use_cnt);
 
 	if (otg_use_cnt == 0) {
 		printk(KERN_ERR "%s: Unbalanced disable for USB OTG port\n", __func__);
-		return -ESRCH;
+		retval = -ESRCH;
+		goto out;
 	}
 	otg_use_cnt--;
 	if (otg_use_cnt != 0)
-		return 0;
+		goto out;
 
 	// TODO: Can we keep the IRQ active while in suspend mode?
 	disable_irq(37);
@@ -850,18 +854,26 @@ int usbotg_low_power_enter(void)
 		/* Enable accessory charging */
 	//	accessory_charger_enable();
 	//}
-	return 0;
+
+out:
+	mutex_unlock(&otg_mutex);
+	return retval;
 }
 
 EXPORT_SYMBOL(usbotg_low_power_enter);
 
-int usbotg_low_power_exit(void)
+/*
+ * __usbotg_low_power_exit - Exit from USB low power suspend/clock disable mode
+ *
+ * Assumed to be called with otg_mutex held.
+ */
+static int __usbotg_low_power_exit(void)
 {
 	struct clk *usb_phy1_clk;
 
 	printk(KERN_INFO "%s: begin. otg_use_cnt=%d\n", __func__, otg_use_cnt);
 
-	if (otg_use_cnt++)
+	if ((otg_use_cnt++) != 0)
 		return 0;
 
 	pmic_vusb2_enable_vote(1, VUSB2_VOTE_SOURCE_OTG);
@@ -927,13 +939,24 @@ int usbotg_low_power_exit(void)
 	return 0;
 }
 
+int usbotg_low_power_exit(void)
+{
+	int ret;
+
+	mutex_lock(&otg_mutex);
+	ret = __usbotg_low_power_exit();
+	mutex_unlock(&otg_mutex);
+
+	return ret;
+}
+
 EXPORT_SYMBOL(usbotg_low_power_exit);
 
 int usbotg_init(struct platform_device *pdev)
 {
 	struct fsl_usb2_platform_data *pdata = pdev->dev.platform_data;
 	struct fsl_xcvr_ops *xops;
-	int ret;
+	int ret = 0;
 
 	pr_debug("%s: pdev=0x%p  pdata=0x%p\n", __func__, pdev, pdata);
 
@@ -946,32 +969,38 @@ int usbotg_init(struct platform_device *pdev)
 	pdata->xcvr_type = xops->xcvr_type;
 	pdata->pdev = pdev;
 
+	mutex_lock(&otg_mutex);
 	/* Ensure we are not in low power suspend.
 	 * Maybe we need to skip other initialisation steps when in low power suspend?
 	 */
 	if (otg_init_cnt && !otg_use_cnt) {
 		/* HACK: someone has already initialised the USB device, but is currently not
 		 * using it. Wake the controller up from low power suspend. */
-		ret = usbotg_low_power_exit();
+		ret = __usbotg_low_power_exit();
 		if (ret)
-			return ret;
+			goto out;
 		otg_use_cnt--;
 	}
 
 	if (!otg_init_cnt) {
-		if (fsl_check_usbclk() != 0)
-			return -EINVAL;
+		if (fsl_check_usbclk() != 0) {
+			ret = -EINVAL;
+			goto out;
+		}
 		if (cpu_is_mx50())
 			/* Turn on AHB CLK for OTG*/
 			USB_CLKONOFF_CTRL &= ~OTG_AHBCLK_OFF;
 
 		pr_debug("%s: grab pins\n", __func__);
-		if (pdata->gpio_usb_active && pdata->gpio_usb_active())
-			return -EINVAL;
+		if (pdata->gpio_usb_active && pdata->gpio_usb_active()) {
+			ret = -EINVAL;
+			goto out;
+		}
 
 		if (clk_enable(usb_clk)) {
 			printk(KERN_ERR "clk_enable(usb_clk) failed\n");
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out;
 		}
 
 		if (xops->init)
@@ -1000,7 +1029,10 @@ int usbotg_init(struct platform_device *pdev)
 	otg_init_cnt++;
 	otg_use_cnt++;
 	pr_debug("%s: success\n", __func__);
-	return 0;
+
+out:
+	mutex_unlock(&otg_mutex);
+	return ret;
 }
 EXPORT_SYMBOL(usbotg_init);
 
@@ -1020,6 +1052,7 @@ int otg_set_resources(struct resource *resources)
 EXPORT_SYMBOL(otg_set_resources);
 
 void usbotg_uninit_port(struct fsl_usb2_platform_data *pdata) {
+	mutex_lock(&otg_mutex);
 	otg_init_cnt--;
 	if (!otg_init_cnt) {
 		if (pdata->xcvr_ops && pdata->xcvr_ops->uninit)
@@ -1032,6 +1065,7 @@ void usbotg_uninit_port(struct fsl_usb2_platform_data *pdata) {
 		 * let's hope it works.
 		 */
 	}
+	mutex_unlock(&otg_mutex);
 }
 EXPORT_SYMBOL(usbotg_uninit_port);
 
