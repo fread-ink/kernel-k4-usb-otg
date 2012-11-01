@@ -3213,8 +3213,8 @@ static int __init fsl_udc_probe(struct platform_device *pdev)
 	udc_controller->transceiver = otg_get_transceiver();
 	if (!udc_controller->transceiver) {
 		printk(KERN_ERR "Can't find OTG driver! (try modprobe \"fsl_otg_arc\" first)\n");
-		kfree(udc_controller);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err1a;
 	}
 #endif
 
