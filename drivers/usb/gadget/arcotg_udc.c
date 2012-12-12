@@ -600,12 +600,6 @@ static void dr_controller_stop(struct fsl_udc *udc)
 
 	DBG("%s\n", __func__);
 
-	if (last_free_td != NULL) {
-		dma_pool_free(udc->td_pool, last_free_td,
-			last_free_td->td_dma);
-		last_free_td = NULL;
-	}
-
 	udc_suspend(udc);
 
 	/* disable IO output */
@@ -3495,6 +3489,11 @@ static int __exit fsl_udc_remove(struct platform_device *pdev)
 	kfree(udc_controller->status_req);
 	kfree(udc_controller->eps);
 
+	if (last_free_td != NULL) {
+		dma_pool_free(udc_controller->td_pool, last_free_td,
+			last_free_td->td_dma);
+		last_free_td = NULL;
+	}
 	dma_pool_destroy(udc_controller->td_pool);
 
 	iounmap((u8 __iomem *)dr_regs);
