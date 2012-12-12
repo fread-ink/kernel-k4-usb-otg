@@ -3561,8 +3561,8 @@ static int low_power_enter(struct fsl_udc *udc)
 
 	host_detected = 0;
 
-	if (udc->driver && udc->driver->disconnect)
-		udc->driver->disconnect(&udc->gadget);
+	if (udc->driver && udc->driver->suspend)
+		udc->driver->suspend(&udc->gadget);
 
 	device_remove_file(udc->gadget.dev.parent, &dev_attr_connected);
 	kobject_uevent_atomic(&udc->gadget.dev.parent->kobj, KOBJ_REMOVE);
@@ -3605,6 +3605,9 @@ static int low_power_exit(struct fsl_udc *udc)
 	udc->usb_state = USB_STATE_ATTACHED;
 	udc->ep0_state = WAIT_FOR_SETUP;
 	udc->ep0_dir = 0;
+
+	if (udc->driver && udc->driver->resume)
+		udc->driver->resume(&udc->gadget);
 
 	if (is_charger_connected()) {
 		fsl_detect_charger_type();
