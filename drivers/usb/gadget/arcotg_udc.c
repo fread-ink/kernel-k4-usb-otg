@@ -3560,12 +3560,8 @@ static int low_power_enter(struct fsl_udc *udc)
 
 	host_detected = 0;
 
-	if (udc->driver) {
-		if (udc->driver->disconnect)
-			udc->driver->disconnect(&udc->gadget);
-
-		if (udc->driver->suspend)
-			udc->driver->suspend(&udc->gadget);
+	if (udc->driver && udc->driver->suspend) {
+		udc->driver->suspend(&udc->gadget);
 	}
 
 	device_remove_file(udc->gadget.dev.parent, &dev_attr_connected);
